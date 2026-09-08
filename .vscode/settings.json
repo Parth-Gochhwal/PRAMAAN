@@ -1,0 +1,9 @@
+{
+    "cmake.configureOnOpen": true,
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+    "files.associations": {
+        "*.hpp": "cpp",
+        "*.cu": "cuda-cpp",
+        "*.cuh": "cuda-cpp"
+    }
+}

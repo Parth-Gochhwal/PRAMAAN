@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug pramaan-solve",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/pramaan-solve",
+            "args": ["benchmark/data/afiro.mps"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb"
+        },
+        {
+            "name": "Debug pramaan-verify",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/pramaan-verify",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb"
+        }
+    ]
+}
