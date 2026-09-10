@@ -35,3 +35,21 @@ target_include_directories(pramaan-verify PRIVATE include)
 # enable_language(CUDA)
 # add_library(pramaan_gpu src/gpu/pdhg.cu)
 # target_link_libraries(pramaan-solve PRIVATE pramaan_gpu)
+
+# --- Tests ---
+enable_testing()
+
+add_executable(test_sparse_matrix tests/test_sparse_matrix.cpp)
+target_link_libraries(test_sparse_matrix PRIVATE pramaan_core)
+add_test(NAME test_sparse_matrix COMMAND test_sparse_matrix
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_simplex_tiny_lp tests/test_simplex_tiny_lp.cpp)
+target_link_libraries(test_simplex_tiny_lp PRIVATE pramaan_core)
+add_test(NAME test_simplex_tiny_lp COMMAND test_simplex_tiny_lp
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_mps_parser tests/test_mps_parser.cpp)
+target_link_libraries(test_mps_parser PRIVATE pramaan_core)
+add_test(NAME test_mps_parser COMMAND test_mps_parser
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
