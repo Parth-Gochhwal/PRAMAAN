@@ -53,3 +53,8 @@ add_executable(test_mps_parser tests/test_mps_parser.cpp)
 target_link_libraries(test_mps_parser PRIVATE pramaan_core)
 add_test(NAME test_mps_parser COMMAND test_mps_parser
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_sparse_revised_simplex tests/test_sparse_revised_simplex.cpp)
+target_link_libraries(test_sparse_revised_simplex PRIVATE pramaan_core)
+add_test(NAME test_sparse_revised_simplex COMMAND test_sparse_revised_simplex
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

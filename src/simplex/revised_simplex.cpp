@@ -1,39 +1,27 @@
-// revised_simplex.cpp -- see include/pramaan/simplex.hpp
+// revised_simplex.cpp
 //
-// Implements a classic two-phase, dense, tableau-based primal simplex.
-// This file does three things, in order:
+// Implements a sparse revised primal simplex solver.
+// Replaces the dense tableau implementation with a sparse product-form
+// inverse (PFI) based revised simplex, as described in the Huangfu & Hall
+// papers (e.g. "Parallelizing the dual revised simplex method").
 //
-//   1. Transform the general ModelIR (ranged rows, arbitrary finite/
-//      infinite variable bounds, min or max) into standard form:
-//          minimize   internal_c^T t
-//          subject to  M t {<=,=,>=} rhs   (rhs >= 0)
-//                      t >= 0
-//      via the textbook substitutions: shift each bounded variable so its
-//      lower bound becomes 0, split each free variable into the difference
-//      of two non-negative parts, and turn a finite upper bound into an
-//      explicit "<=" row. A row that's already ranged (both a finite lower
-//      and upper bound) is split into one "<=" row and one ">=" row.
+// 1. Converts ModelIR into a sparse standard form (Ax = b, x >= 0) using CSC.
+// 2. Maintains an explicit basis and a sequence of Eta matrices for B^-1.
+// 3. Performs FTRAN and BTRAN entirely using sparse data structures.
+// 4. Periodically reinverts the basis by rebuilding the Product Form of the
+//    Inverse (PFI) representation using transformed basis columns.
+// 5. Extracts the solution in terms of the original variables without
+//    requiring a dense m x n allocation at any point.
 //
-//   2. Build the initial dense tableau (structural columns + one slack per
-//      "<=" row + one surplus/artificial pair per ">=" row + one artificial
-//      per "=" row) and run phase 1 (minimize the sum of artificials) to
-//      find a feasible basis, then phase 2 (minimize the real cost) from
-//      there. Both phases share the same pivot() / iterate() machinery and
-//      use Bland's rule (smallest eligible index, both for entering and for
-//      breaking ratio-test ties) so the method is guaranteed to terminate
-//      in finitely many pivots -- no cycling heuristics needed for an
-//      implementation this size.
-//
-//   3. Map the standard-form solution back onto the original ModelIR
-//      variables, and recompute the objective value and row activity
-//      directly from that solution and the model's own (untouched) data,
-//      so the reported numbers never depend on getting the internal sign
-//      bookkeeping right.
+// Note: This is a Stage-5 sequential PFI foundation. The Eta vectors may
+// densify over many iterations. This is not yet a production implementation
+// using Sparse-LU (e.g. Suhl-Suhl) or Forrest-Tomlin basis updates.
 #include "pramaan/simplex.hpp"
 
 #include <cmath>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace pramaan {
 
@@ -41,10 +29,6 @@ namespace {
 
 using Index = CSRMatrix::Index;
 
-// Maps one structural (post-substitution) column back to the original
-// ModelIR variable it represents, and the sign with which it contributes:
-// +1 for a shifted variable or the positive half of a split free variable,
-// -1 for the negative half of a split free variable.
 struct ColumnMap {
     Index original_var;
     double sign;
@@ -52,25 +36,54 @@ struct ColumnMap {
 
 enum class RowKind { kLessEqual, kGreaterEqual, kEqual };
 
-struct StdRow {
-    std::vector<double> coeffs;  // size == number of structural columns
-    double rhs;                   // always >= 0 by construction
-    RowKind kind;
+struct CSCMatrix {
+    Index num_rows = 0;
+    Index num_cols = 0;
+    std::vector<Index> col_ptr;
+    std::vector<Index> row_idx;
+    std::vector<double> values;
 };
 
-struct StandardForm {
-    std::vector<ColumnMap> columns;      // structural columns
-    std::vector<double> internal_cost;   // size == columns.size(); sign-adjusted for kMaximize
-    std::vector<double> var_shift;       // size == model.numVars(); added back to recover x
-    std::vector<StdRow> rows;
+struct SparseStandardForm {
+    CSCMatrix A;
+    std::vector<double> b;
+    std::vector<double> cost;
+    std::vector<ColumnMap> col_map;
+    std::vector<double> var_shift;
+    std::vector<bool> is_artificial;
+    std::vector<Index> initial_basis;
 };
 
-// Builds the standard-form LP described in the file header comment.
-StandardForm buildStandardForm(const ModelIR& model, double tol) {
+struct Triplet { Index row; Index col; double val; };
+
+CSCMatrix buildCSC(Index num_rows, Index num_cols, const std::vector<Triplet>& triplets) {
+    CSCMatrix csc;
+    csc.num_rows = num_rows;
+    csc.num_cols = num_cols;
+    csc.col_ptr.assign(static_cast<std::size_t>(num_cols + 1), 0);
+
+    for (const auto& t : triplets) {
+        csc.col_ptr[static_cast<std::size_t>(t.col + 1)]++;
+    }
+    for (Index j = 0; j < num_cols; ++j) {
+        csc.col_ptr[static_cast<std::size_t>(j + 1)] += csc.col_ptr[static_cast<std::size_t>(j)];
+    }
+    csc.row_idx.resize(triplets.size());
+    csc.values.resize(triplets.size());
+    std::vector<Index> cursor = csc.col_ptr;
+    for (const auto& t : triplets) {
+        Index pos = cursor[static_cast<std::size_t>(t.col)]++;
+        csc.row_idx[static_cast<std::size_t>(pos)] = t.row;
+        csc.values[static_cast<std::size_t>(pos)] = t.val;
+    }
+    return csc;
+}
+
+SparseStandardForm buildSparseStandardForm(const ModelIR& model, double tol) {
     const Index n = model.numVars();
     const Index m = model.numRows();
 
-    StandardForm sf;
+    SparseStandardForm sf;
     sf.var_shift.assign(static_cast<std::size_t>(n), 0.0);
 
     std::vector<Index> single_col(static_cast<std::size_t>(n), -1);
@@ -85,229 +98,385 @@ StandardForm buildStandardForm(const ModelIR& model, double tol) {
                                : model.obj_coeffs[static_cast<std::size_t>(j)];
         if (lo <= -kInfinity) {
             is_free[static_cast<std::size_t>(j)] = 1;
-            plus_col[static_cast<std::size_t>(j)] = static_cast<Index>(sf.columns.size());
-            sf.columns.push_back(ColumnMap{j, 1.0});
-            sf.internal_cost.push_back(ic);
-            minus_col[static_cast<std::size_t>(j)] = static_cast<Index>(sf.columns.size());
-            sf.columns.push_back(ColumnMap{j, -1.0});
-            sf.internal_cost.push_back(-ic);
+            plus_col[static_cast<std::size_t>(j)] = static_cast<Index>(sf.col_map.size());
+            sf.col_map.push_back(ColumnMap{j, 1.0});
+            sf.cost.push_back(ic);
+            minus_col[static_cast<std::size_t>(j)] = static_cast<Index>(sf.col_map.size());
+            sf.col_map.push_back(ColumnMap{j, -1.0});
+            sf.cost.push_back(-ic);
         } else {
-            single_col[static_cast<std::size_t>(j)] = static_cast<Index>(sf.columns.size());
-            sf.columns.push_back(ColumnMap{j, 1.0});
-            sf.internal_cost.push_back(ic);
+            single_col[static_cast<std::size_t>(j)] = static_cast<Index>(sf.col_map.size());
+            sf.col_map.push_back(ColumnMap{j, 1.0});
+            sf.cost.push_back(ic);
             sf.var_shift[static_cast<std::size_t>(j)] = lo;
         }
     }
 
-    const Index num_structural = static_cast<Index>(sf.columns.size());
+    const Index num_structural = static_cast<Index>(sf.col_map.size());
 
-    // Expands one ModelIR row into a dense structural-column coefficient
-    // vector, applying the free-variable split and returning how much the
-    // row's rhs must be reduced by to account for the shifted variables'
-    // constant offsets (A(t + shift) = A t + A*shift, so A t = rhs - A*shift).
-    auto rowFromModelRow = [&](Index r) -> std::pair<std::vector<double>, double> {
-        std::vector<double> coeffs(static_cast<std::size_t>(num_structural), 0.0);
+    std::vector<Triplet> triplets;
+    std::vector<double> rhs_vals;
+    std::vector<RowKind> row_kinds;
+
+    auto pushRow = [&](std::vector<std::pair<Index, double>> row_nz, double rhs, RowKind kind) {
+        if (rhs < -tol) {
+            for (auto& nz : row_nz) nz.second = -nz.second;
+            rhs = -rhs;
+            if (kind == RowKind::kLessEqual) kind = RowKind::kGreaterEqual;
+            else if (kind == RowKind::kGreaterEqual) kind = RowKind::kLessEqual;
+        }
+        if (rhs < 0.0) rhs = 0.0;
+        Index r = static_cast<Index>(rhs_vals.size());
+        for (const auto& nz : row_nz) {
+            if (std::abs(nz.second) > 1e-14) {
+                triplets.push_back(Triplet{r, nz.first, nz.second});
+            }
+        }
+        rhs_vals.push_back(rhs);
+        row_kinds.push_back(kind);
+    };
+
+    auto rowFromModelRow = [&](Index r) -> std::pair<std::vector<std::pair<Index, double>>, double> {
+        std::vector<std::pair<Index, double>> row_nz;
         double rhs_adjust = 0.0;
         for (const auto& e : model.A.row(r)) {
             const Index j = e.index;
             const double a = e.value;
             if (is_free[static_cast<std::size_t>(j)]) {
-                coeffs[static_cast<std::size_t>(plus_col[static_cast<std::size_t>(j)])] += a;
-                coeffs[static_cast<std::size_t>(minus_col[static_cast<std::size_t>(j)])] += -a;
+                row_nz.push_back({plus_col[static_cast<std::size_t>(j)], a});
+                row_nz.push_back({minus_col[static_cast<std::size_t>(j)], -a});
             } else {
-                coeffs[static_cast<std::size_t>(single_col[static_cast<std::size_t>(j)])] += a;
+                row_nz.push_back({single_col[static_cast<std::size_t>(j)], a});
                 rhs_adjust += a * sf.var_shift[static_cast<std::size_t>(j)];
             }
         }
-        return {coeffs, rhs_adjust};
-    };
-
-    // Appends a row, normalizing its sign so rhs >= 0 (flipping <= <-> >=
-    // as needed; = stays =). Every downstream step assumes this invariant.
-    auto pushRow = [&](std::vector<double> coeffs, double rhs, RowKind kind) {
-        if (rhs < -tol) {
-            for (double& v : coeffs) v = -v;
-            rhs = -rhs;
-            if (kind == RowKind::kLessEqual) kind = RowKind::kGreaterEqual;
-            else if (kind == RowKind::kGreaterEqual) kind = RowKind::kLessEqual;
-        }
-        if (rhs < 0.0) rhs = 0.0;  // clamp residual floating noise from the flip above
-        sf.rows.push_back(StdRow{std::move(coeffs), rhs, kind});
+        return {row_nz, rhs_adjust};
     };
 
     for (Index r = 0; r < m; ++r) {
-        if (model.isFreeRow(r)) continue;  // no restriction at all -- nothing to encode
+        if (model.isFreeRow(r)) continue;
         const double lo = model.row_lower[static_cast<std::size_t>(r)];
         const double up = model.row_upper[static_cast<std::size_t>(r)];
         auto row_pair = rowFromModelRow(r);
-        const std::vector<double>& coeffs = row_pair.first;
+        const auto& row_nz = row_pair.first;
         const double rhs_adjust = row_pair.second;
 
         if (model.isEqualityRow(r)) {
-            pushRow(coeffs, lo - rhs_adjust, RowKind::kEqual);
+            pushRow(row_nz, lo - rhs_adjust, RowKind::kEqual);
         } else if (lo <= -kInfinity) {
-            pushRow(coeffs, up - rhs_adjust, RowKind::kLessEqual);
+            pushRow(row_nz, up - rhs_adjust, RowKind::kLessEqual);
         } else if (up >= kInfinity) {
-            pushRow(coeffs, lo - rhs_adjust, RowKind::kGreaterEqual);
+            pushRow(row_nz, lo - rhs_adjust, RowKind::kGreaterEqual);
         } else {
-            pushRow(coeffs, up - rhs_adjust, RowKind::kLessEqual);
-            pushRow(coeffs, lo - rhs_adjust, RowKind::kGreaterEqual);
+            pushRow(row_nz, up - rhs_adjust, RowKind::kLessEqual);
+            pushRow(row_nz, lo - rhs_adjust, RowKind::kGreaterEqual);
         }
     }
 
-    // Explicit upper-bound rows introduced by shifting/splitting above.
     for (Index j = 0; j < n; ++j) {
         const double up = model.var_upper[static_cast<std::size_t>(j)];
         if (up >= kInfinity) continue;
-        std::vector<double> coeffs(static_cast<std::size_t>(num_structural), 0.0);
+        std::vector<std::pair<Index, double>> row_nz;
         double rhs;
         if (is_free[static_cast<std::size_t>(j)]) {
-            coeffs[static_cast<std::size_t>(plus_col[static_cast<std::size_t>(j)])] = 1.0;
-            coeffs[static_cast<std::size_t>(minus_col[static_cast<std::size_t>(j)])] = -1.0;
+            row_nz.push_back({plus_col[static_cast<std::size_t>(j)], 1.0});
+            row_nz.push_back({minus_col[static_cast<std::size_t>(j)], -1.0});
             rhs = up;
         } else {
-            coeffs[static_cast<std::size_t>(single_col[static_cast<std::size_t>(j)])] = 1.0;
+            row_nz.push_back({single_col[static_cast<std::size_t>(j)], 1.0});
             rhs = up - sf.var_shift[static_cast<std::size_t>(j)];
         }
-        pushRow(coeffs, rhs, RowKind::kLessEqual);
+        pushRow(row_nz, rhs, RowKind::kLessEqual);
     }
 
+    Index num_rows_std = static_cast<Index>(rhs_vals.size());
+    sf.b = rhs_vals;
+    sf.initial_basis.assign(static_cast<std::size_t>(num_rows_std), -1);
+
+    Index next_col = num_structural;
+    for (Index i = 0; i < num_rows_std; ++i) {
+        switch (row_kinds[static_cast<std::size_t>(i)]) {
+            case RowKind::kLessEqual:
+                triplets.push_back(Triplet{i, next_col, 1.0});
+                sf.initial_basis[static_cast<std::size_t>(i)] = next_col;
+                next_col++;
+                break;
+            case RowKind::kGreaterEqual:
+                triplets.push_back(Triplet{i, next_col, -1.0});
+                next_col++;
+                triplets.push_back(Triplet{i, next_col, 1.0});
+                sf.initial_basis[static_cast<std::size_t>(i)] = next_col;
+                next_col++;
+                break;
+            case RowKind::kEqual:
+                triplets.push_back(Triplet{i, next_col, 1.0});
+                sf.initial_basis[static_cast<std::size_t>(i)] = next_col;
+                next_col++;
+                break;
+        }
+    }
+
+    Index num_cols_std = next_col;
+    sf.cost.resize(static_cast<std::size_t>(num_cols_std), 0.0);
+    sf.is_artificial.assign(static_cast<std::size_t>(num_cols_std), false);
+    for (Index i = 0; i < num_rows_std; ++i) {
+        if (row_kinds[static_cast<std::size_t>(i)] == RowKind::kEqual || row_kinds[static_cast<std::size_t>(i)] == RowKind::kGreaterEqual) {
+            sf.is_artificial[static_cast<std::size_t>(sf.initial_basis[static_cast<std::size_t>(i)])] = true;
+        }
+    }
+
+    sf.A = buildCSC(num_rows_std, num_cols_std, triplets);
     return sf;
 }
 
-// Full dense tableau: A is num_rows x num_cols (already reduced so that
-// column basis[i] is the i-th unit vector), b is the current basic
-// solution, cost holds the current reduced costs (0 on every basic
-// column), and obj_value == the current value of whichever objective
-// `cost` was built from.
-struct Tableau {
-    Index num_rows = 0;
-    Index num_cols = 0;
-    std::vector<std::vector<double>> A;
-    std::vector<double> b;
-    std::vector<double> cost;
-    double obj_value = 0.0;
-    std::vector<Index> basis;
+struct EtaMatrix {
+    Index p;
+    std::vector<Index> indices;
+    std::vector<double> values;
 };
 
-// Recomputes cost/obj_value for `raw_cost` against the tableau's CURRENT
-// basis: cost = raw_cost - c_B^T * A, obj_value = c_B^T * b. Used once to
-// start each phase (phase 2 reuses phase 1's already-reduced A/b).
-void recomputeReducedCosts(Tableau& t, const std::vector<double>& raw_cost) {
-    t.cost = raw_cost;
-    t.obj_value = 0.0;
-    for (Index i = 0; i < t.num_rows; ++i) {
-        const double cb = raw_cost[static_cast<std::size_t>(t.basis[static_cast<std::size_t>(i)])];
-        if (cb == 0.0) continue;
-        const std::vector<double>& row = t.A[static_cast<std::size_t>(i)];
-        for (Index j = 0; j < t.num_cols; ++j) {
-            t.cost[static_cast<std::size_t>(j)] -= cb * row[static_cast<std::size_t>(j)];
+void ftran(const std::vector<EtaMatrix>& etas, std::vector<double>& x) {
+    for (const auto& eta : etas) {
+        double x_p = x[static_cast<std::size_t>(eta.p)];
+        if (x_p != 0.0) {
+            x[static_cast<std::size_t>(eta.p)] = 0.0;
+            for (size_t k = 0; k < eta.indices.size(); ++k) {
+                x[static_cast<std::size_t>(eta.indices[k])] += x_p * eta.values[k];
+            }
         }
-        t.obj_value += cb * t.b[static_cast<std::size_t>(i)];
     }
 }
 
-// Standard Gauss-Jordan pivot on (r, q): normalize row r so A[r][q] == 1,
-// then eliminate column q from every other row and from the cost row.
-void pivot(Tableau& t, Index r, Index q) {
-    std::vector<double>& prow = t.A[static_cast<std::size_t>(r)];
-    const double piv = prow[static_cast<std::size_t>(q)];
-    for (Index j = 0; j < t.num_cols; ++j) prow[static_cast<std::size_t>(j)] /= piv;
-    t.b[static_cast<std::size_t>(r)] /= piv;
-
-    for (Index i = 0; i < t.num_rows; ++i) {
-        if (i == r) continue;
-        std::vector<double>& row = t.A[static_cast<std::size_t>(i)];
-        const double factor = row[static_cast<std::size_t>(q)];
-        if (factor == 0.0) continue;
-        for (Index j = 0; j < t.num_cols; ++j) {
-            row[static_cast<std::size_t>(j)] -= factor * prow[static_cast<std::size_t>(j)];
+void btran(const std::vector<EtaMatrix>& etas, std::vector<double>& y) {
+    for (auto it = etas.rbegin(); it != etas.rend(); ++it) {
+        const auto& eta = *it;
+        double dot = 0.0;
+        for (size_t k = 0; k < eta.indices.size(); ++k) {
+            dot += y[static_cast<std::size_t>(eta.indices[k])] * eta.values[k];
         }
-        t.b[static_cast<std::size_t>(i)] -= factor * t.b[static_cast<std::size_t>(r)];
+        y[static_cast<std::size_t>(eta.p)] = dot;
     }
-
-    const double cfactor = t.cost[static_cast<std::size_t>(q)];
-    if (cfactor != 0.0) {
-        for (Index j = 0; j < t.num_cols; ++j) {
-            t.cost[static_cast<std::size_t>(j)] -= cfactor * prow[static_cast<std::size_t>(j)];
-        }
-        // obj_value = c_B^T b under the convention used by
-        // recomputeReducedCosts(); a pivot changes it by exactly
-        // (entering variable's reduced cost) * (amount it increases by),
-        // i.e. cfactor * theta, where theta is the entering variable's new
-        // value -- which is precisely prow's post-normalization b-entry.
-        // (This is a genuine "+=": unlike every other row/column update in
-        // this function, obj_value is not itself being eliminated against
-        // the pivot row, it is accumulating the entering variable's
-        // contribution to the objective.)
-        t.obj_value += cfactor * t.b[static_cast<std::size_t>(r)];
-    }
-
-    t.basis[static_cast<std::size_t>(r)] = q;
 }
 
-enum class IterateStatus { kOptimal, kUnbounded, kIterationLimit };
+// Rebuilds the Product Form of the Inverse (PFI) representation from scratch.
+// It applies the currently accumulated etas to each basis column, and uses
+// the transformed basis columns to create a fresh, minimal set of Eta matrices.
+void reinvert(std::vector<EtaMatrix>& etas, std::vector<Index>& basis, const CSCMatrix& A) {
+    etas.clear();
+    Index m = A.num_rows;
+    std::vector<bool> row_used(static_cast<std::size_t>(m), false);
+    std::vector<Index> new_basis(static_cast<std::size_t>(m), -1);
 
-// Runs primal simplex pivots (Bland's rule) until optimal, unbounded, or
-// `max_iterations` total pivots (shared across phase 1 + phase 2, tracked
-// via `iterations_used`) is hit. Columns with blocked[j] == true are never
-// selected as the entering variable (used in phase 2 to permanently lock
-// out artificial columns).
-IterateStatus iterate(Tableau& t, const std::vector<bool>& blocked, double tol,
-                       int max_iterations, int& iterations_used) {
-    while (iterations_used < max_iterations) {
+    for (Index k = 0; k < m; ++k) {
+        std::vector<double> u(static_cast<std::size_t>(m), 0.0);
+        Index bcol = basis[static_cast<std::size_t>(k)];
+        for(Index idx = A.col_ptr[static_cast<std::size_t>(bcol)]; idx < A.col_ptr[static_cast<std::size_t>(bcol+1)]; ++idx) {
+            u[static_cast<std::size_t>(A.row_idx[static_cast<std::size_t>(idx)])] = A.values[static_cast<std::size_t>(idx)];
+        }
+        ftran(etas, u);
+
+        Index best_p = -1;
+        double max_val = 0.0;
+        for (Index i = 0; i < m; ++i) {
+            if (!row_used[static_cast<std::size_t>(i)]) {
+                double abs_val = std::abs(u[static_cast<std::size_t>(i)]);
+                if (abs_val > max_val) {
+                    max_val = abs_val;
+                    best_p = i;
+                }
+            }
+        }
+        if (best_p == -1 || max_val < 1e-12) {
+            throw std::runtime_error("Singular basis in reinvert()");
+        }
+        row_used[static_cast<std::size_t>(best_p)] = true;
+        new_basis[static_cast<std::size_t>(best_p)] = basis[static_cast<std::size_t>(k)];
+
+        EtaMatrix eta;
+        eta.p = best_p;
+        double inv_u_p = 1.0 / u[static_cast<std::size_t>(best_p)];
+        for (Index i = 0; i < m; ++i) {
+            if (std::abs(u[static_cast<std::size_t>(i)]) > 1e-14 || i == best_p) {
+                eta.indices.push_back(i);
+                eta.values.push_back(i == best_p ? inv_u_p : -u[static_cast<std::size_t>(i)] * inv_u_p);
+            }
+        }
+        etas.push_back(std::move(eta));
+    }
+    basis = std::move(new_basis);
+}
+
+void driveOutArtificials(const CSCMatrix& A, std::vector<Index>& basis,
+                         std::vector<double>& x_B, std::vector<EtaMatrix>& etas,
+                         const std::vector<bool>& is_artificial, double tol) {
+    Index m = A.num_rows;
+    Index n = A.num_cols;
+
+    std::vector<bool> is_basic(static_cast<std::size_t>(n), false);
+    for (Index i = 0; i < m; ++i) {
+        is_basic[static_cast<std::size_t>(basis[static_cast<std::size_t>(i)])] = true;
+    }
+
+    for (Index i = 0; i < m; ++i) {
+        Index bcol = basis[static_cast<std::size_t>(i)];
+        if (!is_artificial[static_cast<std::size_t>(bcol)]) continue;
+        
+        std::vector<double> y(static_cast<std::size_t>(m), 0.0);
+        y[static_cast<std::size_t>(i)] = 1.0;
+        btran(etas, y);
+        
         Index entering = -1;
-        for (Index j = 0; j < t.num_cols; ++j) {
-            if (blocked[static_cast<std::size_t>(j)]) continue;
-            if (t.cost[static_cast<std::size_t>(j)] < -tol) {
+        for (Index j = 0; j < n; ++j) {
+            if (is_artificial[static_cast<std::size_t>(j)] || is_basic[static_cast<std::size_t>(j)]) continue;
+            double a_ij = 0.0;
+            for (Index idx = A.col_ptr[static_cast<std::size_t>(j)]; idx < A.col_ptr[static_cast<std::size_t>(j+1)]; ++idx) {
+                a_ij += y[static_cast<std::size_t>(A.row_idx[static_cast<std::size_t>(idx)])] * A.values[static_cast<std::size_t>(idx)];
+            }
+            if (std::abs(a_ij) > tol && std::isfinite(a_ij)) {
                 entering = j;
                 break;
             }
         }
-        if (entering < 0) return IterateStatus::kOptimal;
-
-        Index leaving = -1;
-        double best_ratio = 0.0;
-        for (Index i = 0; i < t.num_rows; ++i) {
-            const double a = t.A[static_cast<std::size_t>(i)][static_cast<std::size_t>(entering)];
-            if (a <= tol) continue;
-            const double ratio = t.b[static_cast<std::size_t>(i)] / a;
-            const bool strictly_better = (leaving < 0) || (ratio < best_ratio - tol);
-            const bool tied_but_lower_index =
-                (leaving >= 0) && (ratio < best_ratio + tol) &&
-                (t.basis[static_cast<std::size_t>(i)] < t.basis[static_cast<std::size_t>(leaving)]);
-            if (strictly_better || tied_but_lower_index) {
-                leaving = i;
-                best_ratio = ratio;
+        
+        if (entering != -1) {
+            std::vector<double> u(static_cast<std::size_t>(m), 0.0);
+            for (Index idx = A.col_ptr[static_cast<std::size_t>(entering)]; idx < A.col_ptr[static_cast<std::size_t>(entering+1)]; ++idx) {
+                u[static_cast<std::size_t>(A.row_idx[static_cast<std::size_t>(idx)])] = A.values[static_cast<std::size_t>(idx)];
             }
-        }
-        if (leaving < 0) return IterateStatus::kUnbounded;
+            ftran(etas, u);
+            
+            double u_p = u[static_cast<std::size_t>(i)];
+            if (!std::isfinite(u_p) || std::abs(u_p) <= tol) continue;
 
-        pivot(t, leaving, entering);
-        ++iterations_used;
+            double theta = x_B[static_cast<std::size_t>(i)] / u_p;
+            for (Index k = 0; k < m; ++k) {
+                if (k == i) x_B[static_cast<std::size_t>(k)] = theta;
+                else {
+                    x_B[static_cast<std::size_t>(k)] -= theta * u[static_cast<std::size_t>(k)];
+                    if (x_B[static_cast<std::size_t>(k)] < 0.0 && x_B[static_cast<std::size_t>(k)] > -tol) {
+                        x_B[static_cast<std::size_t>(k)] = 0.0;
+                    }
+                }
+            }
+
+            is_basic[static_cast<std::size_t>(basis[static_cast<std::size_t>(i)])] = false;
+            basis[static_cast<std::size_t>(i)] = entering;
+            is_basic[static_cast<std::size_t>(entering)] = true;
+
+            EtaMatrix eta;
+            eta.p = i;
+            double inv_u_p = 1.0 / u_p;
+            for (Index k = 0; k < m; ++k) {
+                if (std::abs(u[static_cast<std::size_t>(k)]) > 1e-14 || k == i) {
+                    eta.indices.push_back(k);
+                    eta.values.push_back(k == i ? inv_u_p : -u[static_cast<std::size_t>(k)] * inv_u_p);
+                }
+            }
+            etas.push_back(std::move(eta));
+        }
     }
-    return IterateStatus::kIterationLimit;
 }
 
-// After phase 1 reaches a feasible (objective ~0) basis, any artificial
-// variable still basic must be sitting at value ~0 (else phase 1 wouldn't
-// be optimal). Try to pivot each one out in favor of a genuine column so
-// phase 2 starts from a clean basis; if a row has no genuine column with a
-// nonzero entry, that row is linearly dependent on the others (a redundant
-// constraint) and is simply left with its artificial basic at 0 -- phase 2
-// permanently blocks artificials from re-entering, so this is harmless.
-void driveOutArtificials(Tableau& t, const std::vector<bool>& is_artificial, double tol) {
-    for (Index i = 0; i < t.num_rows; ++i) {
-        const Index bcol = t.basis[static_cast<std::size_t>(i)];
-        if (!is_artificial[static_cast<std::size_t>(bcol)]) continue;
-        for (Index j = 0; j < t.num_cols; ++j) {
-            if (is_artificial[static_cast<std::size_t>(j)]) continue;
-            if (std::abs(t.A[static_cast<std::size_t>(i)][static_cast<std::size_t>(j)]) > tol) {
-                pivot(t, i, j);
-                break;
+enum class IterateStatus { kOptimal, kUnbounded, kIterationLimit };
+
+IterateStatus iterate(const CSCMatrix& A, const std::vector<double>& b,
+                      const std::vector<double>& cost, std::vector<Index>& basis,
+                      std::vector<double>& x_B, std::vector<EtaMatrix>& etas,
+                      const std::vector<bool>& blocked, double tol,
+                      int max_iterations, int& iterations_used) {
+    Index m = A.num_rows;
+    Index n = A.num_cols;
+    int reinvert_freq = 50;
+    int iters_since_reinvert = 0;
+
+    std::vector<bool> is_basic(static_cast<std::size_t>(n), false);
+    for (Index i = 0; i < m; ++i) {
+        is_basic[static_cast<std::size_t>(basis[static_cast<std::size_t>(i)])] = true;
+    }
+
+    while (iterations_used < max_iterations) {
+        std::vector<double> c_B(static_cast<std::size_t>(m), 0.0);
+        for (Index i = 0; i < m; ++i) c_B[static_cast<std::size_t>(i)] = cost[static_cast<std::size_t>(basis[static_cast<std::size_t>(i)])];
+
+        std::vector<double> y = c_B;
+        btran(etas, y);
+
+        Index entering = -1;
+        double min_rc = -tol;
+        for (Index j = 0; j < n; ++j) {
+            if (is_basic[static_cast<std::size_t>(j)] || blocked[static_cast<std::size_t>(j)]) continue;
+            double z_j = cost[static_cast<std::size_t>(j)];
+            for (Index idx = A.col_ptr[static_cast<std::size_t>(j)]; idx < A.col_ptr[static_cast<std::size_t>(j+1)]; ++idx) {
+                z_j -= y[static_cast<std::size_t>(A.row_idx[static_cast<std::size_t>(idx)])] * A.values[static_cast<std::size_t>(idx)];
+            }
+            if (z_j < min_rc) {
+                entering = j;
+                break; // Bland's rule: first eligible
             }
         }
+
+        if (entering == -1) return IterateStatus::kOptimal;
+
+        std::vector<double> u(static_cast<std::size_t>(m), 0.0);
+        for (Index idx = A.col_ptr[static_cast<std::size_t>(entering)]; idx < A.col_ptr[static_cast<std::size_t>(entering+1)]; ++idx) {
+            u[static_cast<std::size_t>(A.row_idx[static_cast<std::size_t>(idx)])] = A.values[static_cast<std::size_t>(idx)];
+        }
+        ftran(etas, u);
+
+        Index leaving = -1;
+        double best_ratio = 1e30;
+        for (Index i = 0; i < m; ++i) {
+            if (u[static_cast<std::size_t>(i)] > tol) {
+                double ratio = x_B[static_cast<std::size_t>(i)] / u[static_cast<std::size_t>(i)];
+                bool strictly_better = (leaving < 0) || (ratio < best_ratio - tol);
+                bool tied = (leaving >= 0) && (std::abs(ratio - best_ratio) <= tol);
+                bool lower_index = tied && (basis[static_cast<std::size_t>(i)] < basis[static_cast<std::size_t>(leaving)]);
+                if (strictly_better || lower_index) {
+                    leaving = i;
+                    best_ratio = ratio;
+                }
+            }
+        }
+
+        if (leaving == -1) return IterateStatus::kUnbounded;
+
+        double theta = x_B[static_cast<std::size_t>(leaving)] / u[static_cast<std::size_t>(leaving)];
+        for (Index i = 0; i < m; ++i) {
+            if (i == leaving) x_B[static_cast<std::size_t>(i)] = theta;
+            else {
+                x_B[static_cast<std::size_t>(i)] -= theta * u[static_cast<std::size_t>(i)];
+                if (x_B[static_cast<std::size_t>(i)] < 0.0 && x_B[static_cast<std::size_t>(i)] > -tol) {
+                    x_B[static_cast<std::size_t>(i)] = 0.0;
+                }
+            }
+        }
+
+        is_basic[static_cast<std::size_t>(basis[static_cast<std::size_t>(leaving)])] = false;
+        basis[static_cast<std::size_t>(leaving)] = entering;
+        is_basic[static_cast<std::size_t>(entering)] = true;
+
+        EtaMatrix eta;
+        eta.p = leaving;
+        double inv_u_p = 1.0 / u[static_cast<std::size_t>(leaving)];
+        for (Index i = 0; i < m; ++i) {
+            if (std::abs(u[static_cast<std::size_t>(i)]) > 1e-14 || i == leaving) {
+                eta.indices.push_back(i);
+                eta.values.push_back(i == leaving ? inv_u_p : -u[static_cast<std::size_t>(i)] * inv_u_p);
+            }
+        }
+        etas.push_back(std::move(eta));
+
+        ++iterations_used;
+        ++iters_since_reinvert;
+
+        if (iters_since_reinvert >= reinvert_freq) {
+            reinvert(etas, basis, A);
+            x_B = b;
+            ftran(etas, x_B);
+            iters_since_reinvert = 0;
+        }
     }
+    return IterateStatus::kIterationLimit;
 }
 
 }  // namespace
@@ -320,18 +489,13 @@ SolveResult RevisedSimplex::solve(const ModelIR& model) const {
 
     SolveResult result;
 
-    const StandardForm sf = buildStandardForm(model, tol);
-    const Index num_structural = static_cast<Index>(sf.columns.size());
-    const Index num_rows_std = static_cast<Index>(sf.rows.size());
+    const SparseStandardForm sf = buildSparseStandardForm(model, tol);
+    const Index num_structural = static_cast<Index>(sf.col_map.size());
+    const Index num_rows_std = sf.A.num_rows;
 
-    // No rows at all: every original row was free and every variable had a
-    // finite lower / infinite upper bound with no "<=" constraint to pivot
-    // against. The feasible region is just {t >= 0}, so the LP is bounded
-    // iff every structural cost is already non-negative, and if so t = 0
-    // (i.e. every variable sits at its lower bound) is optimal.
     if (num_rows_std == 0) {
         bool bounded = true;
-        for (double c : sf.internal_cost) {
+        for (double c : sf.cost) {
             if (c < -tol) {
                 bounded = false;
                 break;
@@ -342,7 +506,7 @@ SolveResult RevisedSimplex::solve(const ModelIR& model) const {
             return result;
         }
         result.status = SolveStatus::kOptimal;
-        result.x = sf.var_shift;  // size n; t == 0 everywhere, so x == shift
+        result.x = sf.var_shift;
         result.is_basic.assign(static_cast<std::size_t>(n), false);
         result.row_activity = model.A.multiply(result.x);
         result.objective_value = model.obj_offset;
@@ -354,74 +518,14 @@ SolveResult RevisedSimplex::solve(const ModelIR& model) const {
         return result;
     }
 
-    // --- lay out slack / surplus / artificial columns, one group per row,
-    // appended after the structural columns ---
-    std::vector<Index> slack_or_surplus_col(static_cast<std::size_t>(num_rows_std), -1);
-    std::vector<Index> artificial_col(static_cast<std::size_t>(num_rows_std), -1);
-    Index next_col = num_structural;
-    for (Index i = 0; i < num_rows_std; ++i) {
-        switch (sf.rows[static_cast<std::size_t>(i)].kind) {
-            case RowKind::kLessEqual:
-                slack_or_surplus_col[static_cast<std::size_t>(i)] = next_col++;
-                break;
-            case RowKind::kGreaterEqual:
-                slack_or_surplus_col[static_cast<std::size_t>(i)] = next_col++;
-                artificial_col[static_cast<std::size_t>(i)] = next_col++;
-                break;
-            case RowKind::kEqual:
-                artificial_col[static_cast<std::size_t>(i)] = next_col++;
-                break;
-        }
-    }
-    const Index num_cols = next_col;
-
-    Tableau t;
-    t.num_rows = num_rows_std;
-    t.num_cols = num_cols;
-    t.A.assign(static_cast<std::size_t>(num_rows_std),
-               std::vector<double>(static_cast<std::size_t>(num_cols), 0.0));
-    t.b.assign(static_cast<std::size_t>(num_rows_std), 0.0);
-    t.basis.assign(static_cast<std::size_t>(num_rows_std), -1);
-
-    std::vector<bool> is_artificial(static_cast<std::size_t>(num_cols), false);
-
-    for (Index i = 0; i < num_rows_std; ++i) {
-        const StdRow& row = sf.rows[static_cast<std::size_t>(i)];
-        for (Index j = 0; j < num_structural; ++j) {
-            t.A[static_cast<std::size_t>(i)][static_cast<std::size_t>(j)] = row.coeffs[static_cast<std::size_t>(j)];
-        }
-        t.b[static_cast<std::size_t>(i)] = row.rhs;
-
-        switch (row.kind) {
-            case RowKind::kLessEqual: {
-                const Index s = slack_or_surplus_col[static_cast<std::size_t>(i)];
-                t.A[static_cast<std::size_t>(i)][static_cast<std::size_t>(s)] = 1.0;
-                t.basis[static_cast<std::size_t>(i)] = s;
-                break;
-            }
-            case RowKind::kGreaterEqual: {
-                const Index s = slack_or_surplus_col[static_cast<std::size_t>(i)];
-                const Index a = artificial_col[static_cast<std::size_t>(i)];
-                t.A[static_cast<std::size_t>(i)][static_cast<std::size_t>(s)] = -1.0;
-                t.A[static_cast<std::size_t>(i)][static_cast<std::size_t>(a)] = 1.0;
-                is_artificial[static_cast<std::size_t>(a)] = true;
-                t.basis[static_cast<std::size_t>(i)] = a;
-                break;
-            }
-            case RowKind::kEqual: {
-                const Index a = artificial_col[static_cast<std::size_t>(i)];
-                t.A[static_cast<std::size_t>(i)][static_cast<std::size_t>(a)] = 1.0;
-                is_artificial[static_cast<std::size_t>(a)] = true;
-                t.basis[static_cast<std::size_t>(i)] = a;
-                break;
-            }
-        }
-    }
+    std::vector<Index> basis = sf.initial_basis;
+    std::vector<double> x_B = sf.b;
+    std::vector<EtaMatrix> etas;
 
     int iterations_used = 0;
 
     bool need_phase1 = false;
-    for (bool f : is_artificial) {
+    for (bool f : sf.is_artificial) {
         if (f) {
             need_phase1 = true;
             break;
@@ -429,14 +533,13 @@ SolveResult RevisedSimplex::solve(const ModelIR& model) const {
     }
 
     if (need_phase1) {
-        std::vector<double> raw_cost1(static_cast<std::size_t>(num_cols), 0.0);
-        for (Index j = 0; j < num_cols; ++j) {
-            if (is_artificial[static_cast<std::size_t>(j)]) raw_cost1[static_cast<std::size_t>(j)] = 1.0;
+        std::vector<double> cost1(static_cast<std::size_t>(sf.A.num_cols), 0.0);
+        for (Index j = 0; j < sf.A.num_cols; ++j) {
+            if (sf.is_artificial[static_cast<std::size_t>(j)]) cost1[static_cast<std::size_t>(j)] = 1.0;
         }
-        recomputeReducedCosts(t, raw_cost1);
 
-        const std::vector<bool> none_blocked(static_cast<std::size_t>(num_cols), false);
-        const IterateStatus st = iterate(t, none_blocked, tol, options_.max_iterations, iterations_used);
+        std::vector<bool> none_blocked(static_cast<std::size_t>(sf.A.num_cols), false);
+        const IterateStatus st = iterate(sf.A, sf.b, cost1, basis, x_B, etas, none_blocked, tol, options_.max_iterations, iterations_used);
 
         if (st == IterateStatus::kIterationLimit) {
             result.status = SolveStatus::kIterationLimit;
@@ -444,29 +547,23 @@ SolveResult RevisedSimplex::solve(const ModelIR& model) const {
             return result;
         }
         if (st == IterateStatus::kUnbounded) {
-            // Phase 1 minimizes a sum of non-negative artificial variables,
-            // which is bounded below by 0 -- this outcome is unreachable
-            // for a correct implementation, so surface it loudly rather
-            // than mislabel the result.
-            throw std::logic_error(
-                "RevisedSimplex: phase 1 reported unbounded, which should be impossible");
+            throw std::logic_error("RevisedSimplex: phase 1 reported unbounded, which should be impossible");
         }
-        if (t.obj_value > tol) {
+
+        double obj1 = 0.0;
+        for (Index i = 0; i < num_rows_std; ++i) {
+            obj1 += cost1[static_cast<std::size_t>(basis[static_cast<std::size_t>(i)])] * x_B[static_cast<std::size_t>(i)];
+        }
+        if (obj1 > tol) {
             result.status = SolveStatus::kInfeasible;
             result.iterations = iterations_used;
             return result;
         }
 
-        driveOutArtificials(t, is_artificial, tol);
+        driveOutArtificials(sf.A, basis, x_B, etas, sf.is_artificial, tol);
     }
 
-    std::vector<double> raw_cost2(static_cast<std::size_t>(num_cols), 0.0);
-    for (Index j = 0; j < num_structural; ++j) {
-        raw_cost2[static_cast<std::size_t>(j)] = sf.internal_cost[static_cast<std::size_t>(j)];
-    }
-    recomputeReducedCosts(t, raw_cost2);
-
-    const IterateStatus st2 = iterate(t, is_artificial, tol, options_.max_iterations, iterations_used);
+    const IterateStatus st2 = iterate(sf.A, sf.b, sf.cost, basis, x_B, etas, sf.is_artificial, tol, options_.max_iterations, iterations_used);
     result.iterations = iterations_used;
 
     if (st2 == IterateStatus::kIterationLimit) {
@@ -478,22 +575,20 @@ SolveResult RevisedSimplex::solve(const ModelIR& model) const {
         return result;
     }
 
-    // --- extract the standard-form solution, then map it back onto the
-    // original ModelIR variables ---
     std::vector<double> x_std(static_cast<std::size_t>(num_structural), 0.0);
     std::vector<bool> col_is_basic(static_cast<std::size_t>(num_structural), false);
     for (Index i = 0; i < num_rows_std; ++i) {
-        const Index bcol = t.basis[static_cast<std::size_t>(i)];
+        const Index bcol = basis[static_cast<std::size_t>(i)];
         if (bcol < num_structural) {
-            x_std[static_cast<std::size_t>(bcol)] = t.b[static_cast<std::size_t>(i)];
+            x_std[static_cast<std::size_t>(bcol)] = x_B[static_cast<std::size_t>(i)];
             col_is_basic[static_cast<std::size_t>(bcol)] = true;
         }
     }
 
-    result.x = sf.var_shift;  // size n; starts each var at its lower bound
+    result.x = sf.var_shift;
     result.is_basic.assign(static_cast<std::size_t>(n), false);
     for (Index col = 0; col < num_structural; ++col) {
-        const ColumnMap& cm = sf.columns[static_cast<std::size_t>(col)];
+        const ColumnMap& cm = sf.col_map[static_cast<std::size_t>(col)];
         result.x[static_cast<std::size_t>(cm.original_var)] += cm.sign * x_std[static_cast<std::size_t>(col)];
         if (col_is_basic[static_cast<std::size_t>(col)]) {
             result.is_basic[static_cast<std::size_t>(cm.original_var)] = true;

@@ -445,6 +445,69 @@ void testSolverIsReusable() {
     checkNear(first.x[1], second.x[1], 1e-9, "Reusable: consistent x2");
 }
 
+void testPhase1BasisCleanup() {
+    // Redundant equality constraint (tests redundant equality / zero-artificial)
+    ModelIR model1(
+        ObjSense::kMinimize,
+        0.0,
+        {1.0, 1.0},
+        denseToCSR({{1.0, 1.0}, {1.0, 1.0}}, 2),
+        {0.0, 0.0},
+        {0.0, 0.0},
+        {"eq1", "eq2"},
+        {0.0, 0.0},
+        {kInfinity, kInfinity},
+        {VarType::kContinuous, VarType::kContinuous},
+        {"x1", "x2"});
+
+    RevisedSimplex solver1;
+    SolveResult res1 = solver1.solve(model1);
+    check(res1.status == SolveStatus::kOptimal, "Cleanup: redundant equalities solve to optimal");
+    if (res1.status == SolveStatus::kOptimal) {
+        checkNear(res1.x[0], 0.0, 1e-9, "Cleanup: x1=0");
+        checkNear(res1.x[1], 0.0, 1e-9, "Cleanup: x2=0");
+    }
+
+    // Infeasible equalities (tests infeasible equality)
+    ModelIR model2(
+        ObjSense::kMinimize,
+        0.0,
+        {1.0},
+        denseToCSR({{1.0}, {1.0}}, 1),
+        {5.0, 6.0},
+        {5.0, 6.0},
+        {"eq1", "eq2"},
+        {0.0},
+        {kInfinity},
+        {VarType::kContinuous},
+        {"x1"});
+
+    RevisedSimplex solver2;
+    SolveResult res2 = solver2.solve(model2);
+    check(res2.status == SolveStatus::kInfeasible, "Cleanup: conflicting equalities are infeasible");
+
+    // Artificial basic variable with a nonbasic replacement
+    ModelIR model3(
+        ObjSense::kMinimize,
+        0.0,
+        {1.0, 1.0},
+        denseToCSR({{1.0, 1.0}}, 2),
+        {0.0},
+        {0.0},
+        {"eq1"},
+        {0.0, 0.0},
+        {kInfinity, kInfinity},
+        {VarType::kContinuous, VarType::kContinuous},
+        {"x1", "x2"});
+
+    RevisedSimplex solver3;
+    SolveResult res3 = solver3.solve(model3);
+    check(res3.status == SolveStatus::kOptimal, "Cleanup: simple equality replacement solves");
+    if (res3.status == SolveStatus::kOptimal) {
+        checkNear(res3.x[0] + res3.x[1], 0.0, 1e-9, "Cleanup: x1+x2=0");
+    }
+}
+
 int main() {
     run("Wyndor Glass Co. (MIT 15.053-style hand-solved LP)", testWyndorGlass);
     run("Wyndor Glass Co., restated as a minimize", testWyndorGlassAsMinimize);
@@ -457,6 +520,7 @@ int main() {
     run("Genuinely ranged row", testRangedRow);
     run("Beale's cycling example (anti-cycling regression)", testBealeCyclingExample);
     run("Solver instance is reusable across solves", testSolverIsReusable);
+    run("Phase 1 basis cleanup (artificials, redundant/infeasible equalities)", testPhase1BasisCleanup);
 
     std::cout << "\n" << g_checks_run << " checks run, " << g_checks_failed << " failed.\n";
     if (g_checks_failed > 0) {
