@@ -6,19 +6,51 @@
 // TransformationLedger (see transformation_ledger.hpp) so the solution can
 // be mapped back to original-variable space and independently verified.
 //
-// FIRST TASK: start with the SIMPLEST possible reduction --
-//   "remove a variable whose lower bound == upper bound (a fixed variable)"
-// and log it to the ledger. Get that one reduction round-tripping correctly
-// (presolve -> solve -> postsolve back to original space) before adding
-// any other reduction. This is the hardest correctness bug source in the
-// whole codebase if done out of order.
+// Stage 6 implements exactly one reduction: fixed-variable removal
+// (lb == ub). Ruiz scaling is provided as a separate, independent step.
 #pragma once
 #include "pramaan/ir.hpp"
+#include "pramaan/transformation_ledger.hpp"
 
 namespace pramaan {
 
-class Presolver {
-    // TODO
+// --- Fixed-variable presolve ---------------------------------------------
+
+// Removes all fixed variables (lb == ub) from the model, substituting their
+// fixed values into the objective offset and RHS vectors. Records each
+// removal in the ledger for exact postsolve reversal.
+//
+// Returns a new, reduced ModelIR with fewer columns. The original model is
+// not modified.
+ModelIR presolve_fixed_variables(const ModelIR& model, TransformationLedger& ledger);
+
+// Reconstructs the original-space solution vector by replaying the ledger
+// in reverse order. `reduced_x` is the solution of the reduced model;
+// returns a vector sized to the original model's variable count.
+std::vector<double> postsolve(const std::vector<double>& reduced_x,
+                              const TransformationLedger& ledger);
+
+// --- Ruiz scaling --------------------------------------------------------
+
+// Holds the row and column scaling factors computed by Ruiz equilibration.
+struct ScalingFactors {
+    std::vector<double> row_scale;   // size = num_rows; row r is multiplied by row_scale[r]
+    std::vector<double> col_scale;   // size = num_cols; col j is multiplied by col_scale[j]
 };
+
+// Applies Ruiz equilibration to the model, returning the scaled model and
+// the scaling factors needed to undo the transformation. Also records
+// the scaling factors in the TransformationLedger for auditability.
+//
+// max_iterations: number of Ruiz equilibration passes (typically 10-20).
+ScalingFactors ruiz_scale(ModelIR& model, TransformationLedger& ledger, int max_iterations = 10);
+
+// Reverses Ruiz scaling on a solution vector obtained from solving the
+// scaled model. `pre_scaled_model` is the reduced model BEFORE Ruiz scaling
+// was applied (i.e. after presolve but before scaling). Its obj_coeffs and
+// obj_offset are used to recompute the correct objective value.
+void unscale_solution(std::vector<double>& x, double& objective_value,
+                      const ModelIR& pre_scaled_model,
+                      const ScalingFactors& factors);
 
 }  // namespace pramaan

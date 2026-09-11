@@ -58,3 +58,8 @@ add_executable(test_sparse_revised_simplex tests/test_sparse_revised_simplex.cpp
 target_link_libraries(test_sparse_revised_simplex PRIVATE pramaan_core)
 add_test(NAME test_sparse_revised_simplex COMMAND test_sparse_revised_simplex
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_presolve_scaling tests/test_presolve_scaling.cpp)
+target_link_libraries(test_presolve_scaling PRIVATE pramaan_core)
+add_test(NAME test_presolve_scaling COMMAND test_presolve_scaling
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
