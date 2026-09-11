@@ -24,12 +24,12 @@ target_include_directories(pramaan_core PUBLIC include)
 add_executable(pramaan-solve src/cli/solve_main.cpp)
 target_link_libraries(pramaan-solve PRIVATE pramaan_core)
 
-# --- pramaan-verify: the INDEPENDENT verifier, deliberately its own small binary ---
-# Does NOT link pramaan_core's solver internals on purpose — it re-derives
-# correctness from the certificate file alone. Only shares certificate.hpp's
-# data format, not solver logic.
+# --- pramaan-verify: the INDEPENDENT verifier ---
+# Links pramaan_core for MPS parsing, certificate I/O, and CSRMatrix::multiply.
+# Does NOT call RevisedSimplex or any solver routine -- independence is
+# enforced by code review, not by link-time isolation.
 add_executable(pramaan-verify src/certificate/verifier_main.cpp)
-target_include_directories(pramaan-verify PRIVATE include)
+target_link_libraries(pramaan-verify PRIVATE pramaan_core)
 
 # --- GPU target: uncommented once you start Phase 4 (CUDA) ---
 # enable_language(CUDA)
@@ -62,4 +62,12 @@ add_test(NAME test_sparse_revised_simplex COMMAND test_sparse_revised_simplex
 add_executable(test_presolve_scaling tests/test_presolve_scaling.cpp)
 target_link_libraries(test_presolve_scaling PRIVATE pramaan_core)
 add_test(NAME test_presolve_scaling COMMAND test_presolve_scaling
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_certificate tests/test_certificate.cpp)
+target_link_libraries(test_certificate PRIVATE pramaan_core)
+target_compile_definitions(test_certificate PRIVATE
+    VERIFIER_EXECUTABLE="$<TARGET_FILE:pramaan-verify>"
+    SOLVER_EXECUTABLE="$<TARGET_FILE:pramaan-solve>")
+add_test(NAME test_certificate COMMAND test_certificate
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
