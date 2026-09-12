@@ -27,3 +27,8 @@ __pycache__/
 # OS-generated files
 .DS_Store
 Thumbs.db
+venv/
+
+# Benchmark data (downloaded Netlib instances) and output (certificates/logs)
+benchmark/data/
+benchmark/output/
