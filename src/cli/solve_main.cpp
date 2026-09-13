@@ -60,6 +60,8 @@ int main(int argc, char** argv) {
         case pramaan::SolveStatus::kInfeasible:    status_str = "INFEASIBLE"; break;
         case pramaan::SolveStatus::kUnbounded:     status_str = "UNBOUNDED"; break;
         case pramaan::SolveStatus::kIterationLimit: status_str = "ITERATION_LIMIT"; break;
+        case pramaan::SolveStatus::kNumericalFailure: status_str = "NUMERICAL_FAILURE"; break;
+        default:                                   status_str = "UNKNOWN"; break;
     }
     std::cout << "  Status: " << status_str << "\n";
 

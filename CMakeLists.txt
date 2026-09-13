@@ -71,3 +71,8 @@ target_compile_definitions(test_certificate PRIVATE
     SOLVER_EXECUTABLE="$<TARGET_FILE:pramaan-solve>")
 add_test(NAME test_certificate COMMAND test_certificate
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_dual_simplex tests/test_dual_simplex.cpp)
+target_link_libraries(test_dual_simplex PRIVATE pramaan_core)
+add_test(NAME test_dual_simplex COMMAND test_dual_simplex
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

@@ -6,24 +6,11 @@
 //
 // SCOPE OF THIS MILESTONE
 // ------------------------
-// Per the roadmap, this is deliberately the DENSE, TEXTBOOK, tableau-based
-// simplex -- not the sparse revised (basis-inverse) formulation. Internally
-// it runs the classic two-phase primal simplex method on a full dense
-// tableau (see revised_simplex.cpp), using Bland's rule throughout for a
-// guaranteed-finite-termination, easy-to-hand-verify implementation. It is
-// correct for any ModelIR (arbitrary finite/infinite variable bounds, any
-// mix of <=, >=, =, ranged and free rows, min or max), which makes it a
-// solid reference oracle for the sparse/revised engine that replaces it
-// later -- but it is O(rows * cols) per pivot with no exploitation of
-// sparsity, so it is only intended for the small, hand-checkable instances
-// this milestone targets, not for Netlib-scale models.
-//
-// NOT YET DONE (left for later milestones, intentionally):
-//   - sparse / revised (basis-inverse) formulation
-//   - dual simplex / warm start from a prior basis
-//   - presolve integration
-//   - numerical stability machinery beyond a single fixed tolerance
-//     (e.g. dynamic scaling, Harris ratio test)
+// This implements a full sparse revised primal simplex method using the Product
+// Form of the Inverse (PFI). It supports arbitrary finite/infinite variable bounds,
+// any mix of <=, >=, =, ranged and free rows, min or max. It is designed to be
+// the primary robust solver engine for the project, capable of solving Netlib
+// benchmark instances accurately and efficiently using sparse matrix operations.
 #pragma once
 
 #include <vector>
@@ -40,6 +27,7 @@ enum class SolveStatus {
     kInfeasible,        // phase 1 proved no feasible point exists
     kUnbounded,          // objective is unbounded on the feasible region
     kIterationLimit,   // stopped without a conclusive result (see SolveResult::iterations)
+    kNumericalFailure, // stopped due to unrecoverable numerical instability
 };
 
 // Result of RevisedSimplex::solve().
@@ -70,13 +58,10 @@ struct SolveResult {
 
     // True basic/nonbasic status per structural variable, in ORIGINAL
     // ModelIR variable order -- size == model.numVars() when status ==
-    // kOptimal. This is a placeholder for warm-starting: the internal
-    // standard-form tableau (with its slack/surplus/artificial columns and
-    // free-variable splits) is not exposed, since that layout is an
-    // implementation detail that will change completely once this becomes
-    // a revised (basis-inverse) simplex. `is_basic[j]` is the one piece of
-    // that information that IS stable across that future rewrite, so it's
-    // exposed now and the rest is deferred.
+    // kOptimal. The full internal standard-form basis (including
+    // slack/surplus/artificial columns and free-variable splits) is not
+    // exposed through SolveResult. `is_basic[j]` reports whether structural
+    // variable j is basic in the final basis.
     std::vector<bool> is_basic;
 };
 
@@ -86,11 +71,10 @@ struct SolveResult {
 //     subject to row_lower <= A x <= row_upper
 //                var_lower <= x   <= var_upper
 //
-// via a dense, two-phase, tableau-based primal simplex (see simplex.hpp's
-// header comment for exactly what this does and doesn't handle yet).
+// via a sparse, two-phase revised primal simplex.
 //
 // Thread-safety: a RevisedSimplex instance holds no mutable state between
-// calls -- `solve()` builds and discards its own tableau -- so the same
+// calls -- `solve()` builds and discards its own internal state -- so the same
 // instance may be reused (even concurrently) across multiple models.
 class RevisedSimplex {
 public:
@@ -101,10 +85,8 @@ public:
         // kIterationLimit instead of hanging.
         int max_iterations = 10000;
 
-        // Absolute tolerance used for every "is this zero / non-negative /
-        // improving" comparison in the tableau (reduced costs, ratio test,
-        // feasibility of bounds). 1e-9 is appropriate for the well-scaled,
-        // small, hand-built instances this milestone targets.
+        // Solver-level tolerance used for feasibility, reduced-cost,
+        // ratio-test, and related numerical comparisons.
         double tolerance = 1e-9;
     };
 
