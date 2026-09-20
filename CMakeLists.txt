@@ -17,6 +17,8 @@ add_library(pramaan_core
     src/simplex/revised_simplex.cpp
     src/simplex/dual_simplex.cpp
     src/certificate/certificate.cpp
+    src/mip/node.cpp
+    src/mip/branch_and_bound.cpp
 )
 target_include_directories(pramaan_core PUBLIC include)
 
@@ -75,4 +77,14 @@ add_test(NAME test_certificate COMMAND test_certificate
 add_executable(test_dual_simplex tests/test_dual_simplex.cpp)
 target_link_libraries(test_dual_simplex PRIVATE pramaan_core)
 add_test(NAME test_dual_simplex COMMAND test_dual_simplex
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_mip_node tests/test_mip_node.cpp)
+target_link_libraries(test_mip_node PRIVATE pramaan_core)
+add_test(NAME test_mip_node COMMAND test_mip_node
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_branch_and_bound tests/test_branch_and_bound.cpp)
+target_link_libraries(test_branch_and_bound PRIVATE pramaan_core)
+add_test(NAME test_branch_and_bound COMMAND test_branch_and_bound
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

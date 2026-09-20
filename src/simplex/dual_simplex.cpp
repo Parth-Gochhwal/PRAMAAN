@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include <iostream>
 
 namespace pramaan {
 
@@ -98,6 +99,36 @@ struct SparseStandardForm {
     std::vector<bool> is_artificial;
     std::vector<Index> initial_basis;
 };
+
+uint64_t computeLayoutFingerprint(const SparseStandardForm& sf) {
+    uint64_t hash = 8469598103934665603ULL;
+    auto add_double = [&](double v) {
+        uint64_t bits;
+        if (v == 0.0) v = 0.0;
+        std::memcpy(&bits, &v, sizeof(double));
+        bits ^= bits >> 33;
+        bits *= 0xff51afd7ed558ccdULL;
+        bits ^= bits >> 33;
+        hash ^= bits;
+        hash *= 1099511628211ULL;
+    };
+    auto add_int = [&](uint64_t v) {
+        v ^= v >> 33;
+        v *= 0xff51afd7ed558ccdULL;
+        v ^= v >> 33;
+        hash ^= v;
+        hash *= 1099511628211ULL;
+    };
+    add_int(sf.A.num_rows);
+    add_int(sf.A.num_cols);
+    for (auto v : sf.A.col_ptr) add_int(v);
+    for (auto v : sf.A.row_idx) add_int(v);
+    for (auto v : sf.A.values) add_double(v);
+    for (bool b : sf.is_artificial) {
+        add_int(b ? 1 : 0);
+    }
+    return hash;
+}
 
 struct Triplet { Index row; Index col; double val; };
 
@@ -680,7 +711,7 @@ DualIterateStatus iterateDual(const CSCMatrix& A, const std::vector<double>& b,
         double theta = x_B[static_cast<std::size_t>(leaving)] / u_leaving;
         for (Index i = 0; i < m; ++i) {
             if (i == leaving) {
-                x_B[static_cast<std::size_t>(i)] = 0.0;
+                x_B[static_cast<std::size_t>(i)] = theta;
             } else {
                 x_B[static_cast<std::size_t>(i)] -= theta * u[static_cast<std::size_t>(i)];
             }
@@ -763,7 +794,30 @@ SolveResult extractSolution(const ModelIR& model, const SparseStandardForm& sf,
 // DualSimplex::captureBasis()
 // =========================================================================
 
-BasisState DualSimplex::captureBasis(const ModelIR& model) const {
+// `out_result`, when non-null, receives the SolveResult of the cold solve
+// this function already performs internally. This lets a caller (notably the
+// B&B engine) obtain both the LP result and the warm-startable basis from a
+// single solve instead of solving the same relaxation twice.
+//
+// Note the two outputs are independent: a solve can reach optimality while
+// still yielding no usable basis (e.g. an artificial remains basic on a
+// redundant row). In that case *out_result is the optimal result and the
+// returned BasisState is empty, which callers must treat as "no warm start
+// available", not as a failed solve.
+BasisState DualSimplex::captureBasis(const ModelIR& model, SolveResult* out_result) const {
+    auto emit = [&](SolveStatus status, const SparseStandardForm* sf,
+                    const std::vector<Index>* basis, const std::vector<double>* x_B,
+                    int iters) {
+        if (out_result == nullptr) return;
+        if (sf == nullptr || basis == nullptr || x_B == nullptr) {
+            *out_result = SolveResult{};
+            out_result->status = status;
+            out_result->iterations = iters;
+        } else {
+            *out_result = extractSolution(model, *sf, *basis, *x_B, status, iters);
+        }
+    };
+
     model.validate();
     const double tol = options_.tolerance;
     const Index n = model.numVars();
@@ -772,7 +826,21 @@ BasisState DualSimplex::captureBasis(const ModelIR& model) const {
     const Index num_rows_std = sf.A.num_rows;
 
     if (num_rows_std == 0) {
-        return BasisState{};  // trivial model, no basis to capture
+        // Trivial model: no constraints survive standard-form conversion, so
+        // there is no basis to capture, but the LP itself is solved.
+        if (out_result != nullptr) {
+            *out_result = SolveResult{};
+            out_result->status = SolveStatus::kOptimal;
+            out_result->x = sf.var_shift;
+            out_result->is_basic.assign(static_cast<std::size_t>(n), false);
+            out_result->row_activity = model.A.multiply(out_result->x);
+            out_result->objective_value = model.obj_offset;
+            for (Index j = 0; j < n; ++j) {
+                out_result->objective_value += model.obj_coeffs[static_cast<std::size_t>(j)] *
+                                               out_result->x[static_cast<std::size_t>(j)];
+            }
+        }
+        return BasisState{};
     }
 
     std::vector<Index> basis = sf.initial_basis;
@@ -794,14 +862,22 @@ BasisState DualSimplex::captureBasis(const ModelIR& model) const {
         std::vector<bool> none_blocked(static_cast<std::size_t>(sf.A.num_cols), false);
         const IterateStatus st = iteratePrimal(sf.A, sf.b, cost1, basis, x_B, etas, none_blocked,
                                                tol, options_.max_iterations, iterations_used);
-        if (st != IterateStatus::kOptimal) return BasisState{};
+        if (st != IterateStatus::kOptimal) {
+            emit(st == IterateStatus::kUnbounded ? SolveStatus::kNumericalFailure
+                                                 : SolveStatus::kIterationLimit,
+                 nullptr, nullptr, nullptr, iterations_used);
+            return BasisState{};
+        }
 
         double obj1 = 0.0;
         for (Index i = 0; i < num_rows_std; ++i) {
             obj1 += cost1[static_cast<std::size_t>(basis[static_cast<std::size_t>(i)])] *
                     x_B[static_cast<std::size_t>(i)];
         }
-        if (obj1 > tol) return BasisState{};  // infeasible
+        if (obj1 > tol) {  // infeasible
+            emit(SolveStatus::kInfeasible, nullptr, nullptr, nullptr, iterations_used);
+            return BasisState{};
+        }
 
         driveOutArtificials(sf.A, basis, x_B, etas, sf.is_artificial, tol);
     }
@@ -809,16 +885,26 @@ BasisState DualSimplex::captureBasis(const ModelIR& model) const {
     // Phase 2
     const IterateStatus st2 = iteratePrimal(sf.A, sf.b, sf.cost, basis, x_B, etas,
                                             sf.is_artificial, tol, options_.max_iterations, iterations_used);
-    if (st2 != IterateStatus::kOptimal) return BasisState{};
+    if (st2 != IterateStatus::kOptimal) {
+        emit(st2 == IterateStatus::kUnbounded ? SolveStatus::kUnbounded
+                                              : SolveStatus::kIterationLimit,
+             nullptr, nullptr, nullptr, iterations_used);
+        return BasisState{};
+    }
 
     // FIX 2: Reject basis if any artificial variables are still basic.
     // If driveOutArtificials could not pivot them out, they remain at 0 (e.g. redundant constraints).
     // Warm-starting from such a basis is unsafe because the redundant constraint's RHS might change.
     for (Index i = 0; i < num_rows_std; ++i) {
         if (sf.is_artificial[static_cast<std::size_t>(basis[static_cast<std::size_t>(i)])]) {
+            // The LP is solved to optimality; only the basis is unusable for
+            // a later warm start.
+            emit(SolveStatus::kOptimal, &sf, &basis, &x_B, iterations_used);
             return BasisState{};
         }
     }
+
+    emit(SolveStatus::kOptimal, &sf, &basis, &x_B, iterations_used);
 
     // Capture the optimal basis
     BasisState state;
@@ -827,6 +913,7 @@ BasisState DualSimplex::captureBasis(const ModelIR& model) const {
         state.basis_columns[static_cast<std::size_t>(i)] = basis[static_cast<std::size_t>(i)];
     }
     state.structural_fingerprint = computeStructuralFingerprint(model);
+    state.std_layout_fingerprint = computeLayoutFingerprint(sf);
     state.orig_num_vars = n;
     state.orig_num_rows = model.numRows();
     state.orig_obj_sense = model.obj_sense;
@@ -838,7 +925,13 @@ BasisState DualSimplex::captureBasis(const ModelIR& model) const {
 // DualSimplex::warmSolve()
 // =========================================================================
 
-SolveResult DualSimplex::warmSolve(const ModelIR& model, const BasisState& basis_state) const {
+// `out_basis`, when non-null, receives the basis this solve ends on, so the
+// caller can warm-start a further modification (in B&B: a grandchild node)
+// without re-solving. It is left empty unless the solve reached optimality
+// with no artificial column basic, matching captureBasis()'s safety rule.
+SolveResult DualSimplex::warmSolve(const ModelIR& model, const BasisState& basis_state,
+                                   BasisState* out_basis) const {
+    if (out_basis != nullptr) *out_basis = BasisState{};
     model.validate();
 
     if (basis_state.empty()) {
@@ -893,6 +986,14 @@ SolveResult DualSimplex::warmSolve(const ModelIR& model, const BasisState& basis
             "which invalidates the cached basis");
     }
 
+    uint64_t sf_hash = computeLayoutFingerprint(sf);
+    if (sf_hash != basis_state.std_layout_fingerprint) {
+        throw std::invalid_argument(
+            "DualSimplex::warmSolve: standard-form layout mismatch — "
+            "the RHS change caused a row sign flip that restructured the matrix, "
+            "which invalidates the cached basis");
+    }
+
     // Validate that all basis column indices are in range and non-duplicate.
     // Must also explicitly reject any artificial columns.
     {
@@ -939,6 +1040,24 @@ SolveResult DualSimplex::warmSolve(const ModelIR& model, const BasisState& basis
         case DualIterateStatus::kInfeasible:       status = SolveStatus::kInfeasible; break;
         case DualIterateStatus::kNumericalFailure: status = SolveStatus::kNumericalFailure; break;
         default:                                   status = SolveStatus::kIterationLimit; break;
+    }
+
+    if (out_basis != nullptr && status == SolveStatus::kOptimal) {
+        bool artificial_basic = false;
+        for (Index i = 0; i < num_rows_std; ++i) {
+            if (sf.is_artificial[static_cast<std::size_t>(basis[static_cast<std::size_t>(i)])]) {
+                artificial_basic = true;
+                break;
+            }
+        }
+        if (!artificial_basic) {
+            out_basis->basis_columns.assign(basis.begin(), basis.end());
+            out_basis->structural_fingerprint = computeStructuralFingerprint(model);
+            out_basis->std_layout_fingerprint = computeLayoutFingerprint(sf);
+            out_basis->orig_num_vars = n;
+            out_basis->orig_num_rows = model.numRows();
+            out_basis->orig_obj_sense = model.obj_sense;
+        }
     }
 
     return extractSolution(model, sf, basis, x_B, status, iterations_used);

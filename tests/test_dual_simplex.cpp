@@ -468,15 +468,15 @@ void testDualInfeasibleBasisRejection() {
     DualSimplex ds;
     BasisState bad_basis = ds.captureBasis(model);
     check(!bad_basis.empty(), "InfeasibleBasis: captured basis");
-    
+
     // We tamper with the columns to make it the slack basis {2, 3}.
     // Since rows are inequalities, slacks are NOT artificial.
-    // This allows it to pass the initial artificial check and hit the 
+    // This allows it to pass the initial artificial check and hit the
     // dual-feasibility check, which should return kNumericalFailure.
-    bad_basis.basis_columns = {2, 3}; 
+    bad_basis.basis_columns = {2, 3};
 
     SolveResult warm = ds.warmSolve(model, bad_basis);
-    check(warm.status == SolveStatus::kNumericalFailure, 
+    check(warm.status == SolveStatus::kNumericalFailure,
           "InfeasibleBasis: dual-infeasible inherited basis safely triggers kNumericalFailure");
 }
 
@@ -498,7 +498,7 @@ void testArtificialBasisRejectionWarmSolve() {
     check(!bad_basis.empty(), "ArtificialReject: captured basis");
 
     // Force an artificial variable into the basis (slacks for equalities are artificial)
-    bad_basis.basis_columns = {0, 2}; 
+    bad_basis.basis_columns = {0, 2};
 
     bool threw = false;
     try {
@@ -507,6 +507,324 @@ void testArtificialBasisRejectionWarmSolve() {
         threw = true;
     }
     check(threw, "ArtificialReject: warmSolve rejects artificial columns");
+}
+
+// =========================================================================
+// Test 11: Knapsack warm-start regression (the exact 19-vs-21 failure)
+// =========================================================================
+// This is the B&B regression: a 0/1 knapsack LP relaxation cold-solved,
+// then warm-solved with a tightened variable upper bound. Previously,
+// warmSolve returned a suboptimal kOptimal result because the dual-simplex
+// pivot formula incorrectly set x_B[leaving]=0 instead of theta.
+void testKnapsackWarmStartRegression() {
+    // maximize 8x0 + 11x1 + 6x2 + 4x3  s.t.  5x0+7x1+4x2+3x3 <= 14,  0<=xi<=1
+    ModelIR model(
+        ObjSense::kMaximize, 0.0, {8.0, 11.0, 6.0, 4.0},
+        denseToCSR({{5.0, 7.0, 4.0, 3.0}}, 4),
+        {-kInfinity}, {14.0}, {"capacity"},
+        {0.0, 0.0, 0.0, 0.0}, {1.0, 1.0, 1.0, 1.0},
+        {VarType::kContinuous, VarType::kContinuous, VarType::kContinuous, VarType::kContinuous},
+        {"x0", "x1", "x2", "x3"});
+
+    DualSimplex ds;
+    SolveResult cold_original;
+    BasisState basis = ds.captureBasis(model, &cold_original);
+    check(!basis.empty(), "Knapsack: captured basis is non-empty");
+    check(cold_original.status == SolveStatus::kOptimal, "Knapsack: root LP optimal");
+    checkNear(cold_original.objective_value, 22.0, 1e-6, "Knapsack: root LP obj=22");
+
+    RevisedSimplex rs;
+
+    // Case A: x0 <= 0  (down branch, was the B&B path that gave 19 instead of 21)
+    {
+        ModelIR mod = model;
+        mod.var_upper[0] = 0.0;
+        SolveResult warm = ds.warmSolve(mod, basis);
+        SolveResult cold = rs.solve(mod);
+        check(warm.status == SolveStatus::kOptimal, "Knapsack x0<=0: warm optimal");
+        check(cold.status == SolveStatus::kOptimal, "Knapsack x0<=0: cold optimal");
+        checkNear(warm.objective_value, cold.objective_value, 1e-6,
+                  "Knapsack x0<=0: warm obj == cold obj");
+        checkNear(warm.objective_value, 21.0, 1e-6, "Knapsack x0<=0: obj=21");
+        checkFeasible(mod, warm, 1e-6, "Knapsack x0<=0 warm");
+        for (size_t j = 0; j < warm.x.size(); ++j) {
+            checkNear(warm.x[j], cold.x[j], 1e-6,
+                      "Knapsack x0<=0: warm x[" + std::to_string(j) + "] == cold");
+        }
+        std::cout << "  x0<=0: warm obj=" << warm.objective_value
+                  << ", iters=" << warm.iterations << "\n";
+    }
+
+    // Case B: x1 <= 0  (previously returned kInfeasible incorrectly)
+    {
+        ModelIR mod = model;
+        mod.var_upper[1] = 0.0;
+        SolveResult warm = ds.warmSolve(mod, basis);
+        SolveResult cold = rs.solve(mod);
+        check(warm.status == SolveStatus::kOptimal, "Knapsack x1<=0: warm optimal");
+        check(cold.status == SolveStatus::kOptimal, "Knapsack x1<=0: cold optimal");
+        checkNear(warm.objective_value, cold.objective_value, 1e-6,
+                  "Knapsack x1<=0: warm obj == cold obj");
+        checkNear(warm.objective_value, 18.0, 1e-6, "Knapsack x1<=0: obj=18");
+        checkFeasible(mod, warm, 1e-6, "Knapsack x1<=0 warm");
+        std::cout << "  x1<=0: warm obj=" << warm.objective_value
+                  << ", iters=" << warm.iterations << "\n";
+    }
+
+    // Case C: x2 <= 0.25 (the minimal reproducer from B&B comments)
+    {
+        ModelIR mod = model;
+        mod.var_upper[2] = 0.25;
+        SolveResult warm = ds.warmSolve(mod, basis);
+        SolveResult cold = rs.solve(mod);
+        check(warm.status == SolveStatus::kOptimal, "Knapsack x2<=0.25: warm optimal");
+        check(cold.status == SolveStatus::kOptimal, "Knapsack x2<=0.25: cold optimal");
+        checkNear(warm.objective_value, cold.objective_value, 1e-6,
+                  "Knapsack x2<=0.25: warm obj == cold obj");
+        checkFeasible(mod, warm, 1e-6, "Knapsack x2<=0.25 warm");
+        std::cout << "  x2<=0.25: warm obj=" << warm.objective_value
+                  << ", iters=" << warm.iterations << "\n";
+    }
+
+    // Case D: x3 <= 0
+    {
+        ModelIR mod = model;
+        mod.var_upper[3] = 0.0;
+        SolveResult warm = ds.warmSolve(mod, basis);
+        SolveResult cold = rs.solve(mod);
+        check(warm.status == SolveStatus::kOptimal, "Knapsack x3<=0: warm optimal");
+        check(cold.status == SolveStatus::kOptimal, "Knapsack x3<=0: cold optimal");
+        checkNear(warm.objective_value, cold.objective_value, 1e-6,
+                  "Knapsack x3<=0: warm obj == cold obj");
+        checkFeasible(mod, warm, 1e-6, "Knapsack x3<=0 warm");
+        std::cout << "  x3<=0: warm obj=" << warm.objective_value
+                  << ", iters=" << warm.iterations << "\n";
+    }
+
+    // Case E: Multiple bound tightenings (x0<=0.5 AND x3<=0.5)
+    {
+        ModelIR mod = model;
+        mod.var_upper[0] = 0.5;
+        mod.var_upper[3] = 0.5;
+        SolveResult warm = ds.warmSolve(mod, basis);
+        SolveResult cold = rs.solve(mod);
+        check(warm.status == SolveStatus::kOptimal, "Knapsack x0<=0.5,x3<=0.5: warm optimal");
+        check(cold.status == SolveStatus::kOptimal, "Knapsack x0<=0.5,x3<=0.5: cold optimal");
+        checkNear(warm.objective_value, cold.objective_value, 1e-6,
+                  "Knapsack x0<=0.5,x3<=0.5: warm obj == cold obj");
+        checkFeasible(mod, warm, 1e-6, "Knapsack x0<=0.5,x3<=0.5 warm");
+        std::cout << "  x0<=0.5,x3<=0.5: warm obj=" << warm.objective_value
+                  << ", iters=" << warm.iterations << "\n";
+    }
+}
+
+// =========================================================================
+// Test 12: Warm-start chaining
+// =========================================================================
+// modified model A -> warm solve -> capture resulting basis -> modified model B -> warm solve
+void testWarmStartChaining() {
+    ModelIR original = makeWyndor();
+
+    DualSimplex ds;
+    SolveResult cold_orig;
+    BasisState basis_A = ds.captureBasis(original, &cold_orig);
+    check(!basis_A.empty(), "Chain: initial basis non-empty");
+
+    // Chain step 1: tighten x1 upper to 1.5
+    ModelIR model_A = original;
+    model_A.var_upper[0] = 1.5;
+
+    BasisState basis_B;
+    SolveResult warm_A = ds.warmSolve(model_A, basis_A, &basis_B);
+    check(warm_A.status == SolveStatus::kOptimal, "Chain step 1: optimal");
+    checkNear(warm_A.objective_value, 34.5, 1e-6, "Chain step 1: obj=34.5");
+    check(!basis_B.empty(), "Chain step 1: output basis non-empty");
+    std::cout << "  Step 1: obj=" << warm_A.objective_value
+              << ", iters=" << warm_A.iterations << "\n";
+
+    // Chain step 2: further tighten x1 upper to 0.5 using basis from step 1
+    ModelIR model_B = original;
+    model_B.var_upper[0] = 0.5;
+
+    SolveResult warm_B = ds.warmSolve(model_B, basis_B);
+    RevisedSimplex rs;
+    SolveResult cold_B = rs.solve(model_B);
+    check(warm_B.status == SolveStatus::kOptimal, "Chain step 2: warm optimal");
+    check(cold_B.status == SolveStatus::kOptimal, "Chain step 2: cold optimal");
+    checkNear(warm_B.objective_value, cold_B.objective_value, 1e-6,
+              "Chain step 2: warm obj == cold obj");
+    checkFeasible(model_B, warm_B, 1e-6, "Chain step 2 warm");
+    std::cout << "  Step 2: obj=" << warm_B.objective_value
+              << ", iters=" << warm_B.iterations << "\n";
+}
+
+// =========================================================================
+// Test 13: Warm result matches cold result
+// =========================================================================
+// Comprehensive check across multiple perturbations of the Wyndor model.
+void testWarmMatchesCold() {
+    ModelIR original = makeWyndor();
+    DualSimplex ds;
+    BasisState basis = ds.captureBasis(original);
+    check(!basis.empty(), "WarmCold: basis non-empty");
+    RevisedSimplex rs;
+
+    // Several bound perturbations
+    struct Case { int var; double new_ub; std::string label; };
+    std::vector<Case> cases = {
+        {0, 1.0, "x1<=1"},
+        {0, 0.5, "x1<=0.5"},
+        {1, 5.0, "x2<=5"},
+        {1, 3.0, "x2<=3"},
+    };
+
+    for (const auto& c : cases) {
+        ModelIR mod = original;
+        mod.var_upper[static_cast<std::size_t>(c.var)] = c.new_ub;
+        SolveResult warm = ds.warmSolve(mod, basis);
+        SolveResult cold = rs.solve(mod);
+        check(warm.status == SolveStatus::kOptimal,
+              "WarmCold " + c.label + ": warm optimal");
+        check(cold.status == SolveStatus::kOptimal,
+              "WarmCold " + c.label + ": cold optimal");
+        checkNear(warm.objective_value, cold.objective_value, 1e-6,
+                  "WarmCold " + c.label + ": objectives match");
+        checkFeasible(mod, warm, 1e-6, "WarmCold " + c.label + " warm");
+        for (size_t j = 0; j < warm.x.size(); ++j) {
+            checkNear(warm.x[j], cold.x[j], 1e-6,
+                      "WarmCold " + c.label + " x[" + std::to_string(j) + "]");
+        }
+    }
+
+    // Several RHS perturbations
+    struct RCase { int row; double new_ub; std::string label; };
+    std::vector<RCase> rcases = {
+        {0, 3.0, "r0<=3"},
+        {1, 10.0, "r1<=10"},
+        {2, 15.0, "r2<=15"},
+    };
+
+    for (const auto& c : rcases) {
+        ModelIR mod = original;
+        mod.row_upper[static_cast<std::size_t>(c.row)] = c.new_ub;
+        SolveResult warm = ds.warmSolve(mod, basis);
+        SolveResult cold = rs.solve(mod);
+        check(warm.status == SolveStatus::kOptimal,
+              "WarmCold " + c.label + ": warm optimal");
+        check(cold.status == SolveStatus::kOptimal,
+              "WarmCold " + c.label + ": cold optimal");
+        checkNear(warm.objective_value, cold.objective_value, 1e-6,
+                  "WarmCold " + c.label + ": objectives match");
+        checkFeasible(mod, warm, 1e-6, "WarmCold " + c.label + " warm");
+    }
+}
+
+// =========================================================================
+// Test 14: RHS Sign Flip Rejection
+// =========================================================================
+// Changing a finite RHS across zero can cause buildSparseStandardForm to flip
+// the row's standard-form sign and RowKind (e.g., kLessEqual -> kGreaterEqual),
+// adding new structural columns (slack -> surplus + artificial).
+// The warm path must detect this layout change and cleanly reject the basis.
+void testRHSSignFlipRejection() {
+    // x0 - x1 <= 5 (RHS > 0, standard form: x0 - x1 + s = 5)
+    ModelIR model(ObjSense::kMaximize, 0.0,
+                   {1.0, 1.0},
+                   denseToCSR({{1.0, -1.0}}, 2),
+                   {-kInfinity}, {5.0}, {"cap"},
+                   {0.0, 0.0}, {10.0, 10.0},
+                   {VarType::kContinuous, VarType::kContinuous},
+                   {"x0", "x1"});
+
+    DualSimplex ds;
+    BasisState basis = ds.captureBasis(model);
+    check(!basis.empty(), "RHSSignFlip: original basis captured");
+
+    // Modify RHS to -5. x0 - x1 <= -5 is equivalent to -x0 + x1 >= 5.
+    // Standard form: -x0 + x1 - surplus + artificial = 5.
+    ModelIR modified = model;
+    modified.row_upper[0] = -5.0;
+
+    bool threw = false;
+    try {
+        ds.warmSolve(modified, basis);
+    } catch (const std::invalid_argument& e) {
+        std::string msg = e.what();
+        if (msg.find("layout mismatch") != std::string::npos) {
+            threw = true;
+        }
+    }
+
+    check(threw, "RHSSignFlip: warmSolve cleanly rejected the structurally shifted standard-form matrix");
+}
+
+// =========================================================================
+// Test 15: Equality RHS Sign Flip Rejection
+// =========================================================================
+// For equality rows, changing RHS across zero negates the standard-form A
+// coefficients but does NOT change the number of columns (adds exactly 1 artificial).
+// The full std_layout_fingerprint (which hashes A.values) must catch this and reject.
+void testEqualityRHSSignFlipRejection() {
+    ModelIR model(ObjSense::kMaximize, 0.0,
+                   {1.0, 1.0},
+                   denseToCSR({{1.0, 1.0}}, 2),
+                   {5.0}, {5.0}, {"eq"},
+                   {0.0, 0.0}, {10.0, 10.0},
+                   {VarType::kContinuous, VarType::kContinuous},
+                   {"x0", "x1"});
+
+    DualSimplex ds;
+    BasisState basis = ds.captureBasis(model);
+    check(!basis.empty(), "EqRHSSignFlip: original basis captured");
+
+    // Modify RHS to -5. The coefficients in sf.A will be negated.
+    ModelIR modified = model;
+    modified.row_lower[0] = -5.0;
+    modified.row_upper[0] = -5.0;
+
+    bool threw = false;
+    try {
+        ds.warmSolve(modified, basis);
+    } catch (const std::invalid_argument& e) {
+        std::string msg = e.what();
+        if (msg.find("layout mismatch") != std::string::npos) {
+            threw = true;
+        }
+    }
+
+    check(threw, "EqRHSSignFlip: warmSolve cleanly rejected the structurally shifted (negated) standard-form matrix");
+}
+
+// =========================================================================
+// Test 16: Ordinary RHS Perturbation (No Sign Flip)
+// =========================================================================
+// Verify that an ordinary RHS perturbation that does NOT cross zero preserves
+// the layout fingerprint and solves successfully.
+void testOrdinaryRHSPerturbation() {
+    ModelIR model(ObjSense::kMaximize, 0.0,
+                   {1.0, 1.0},
+                   denseToCSR({{1.0, 1.0}}, 2),
+                   {-kInfinity}, {5.0}, {"cap"},
+                   {0.0, 0.0}, {10.0, 10.0},
+                   {VarType::kContinuous, VarType::kContinuous},
+                   {"x0", "x1"});
+
+    DualSimplex ds;
+    BasisState basis = ds.captureBasis(model);
+    check(!basis.empty(), "OrdRHS: original basis captured");
+
+    // Modify RHS to 2. No sign flip occurs (2 > 0).
+    ModelIR modified = model;
+    modified.row_upper[0] = 2.0;
+
+    RevisedSimplex rs;
+    SolveResult cold = rs.solve(modified);
+    SolveResult warm = ds.warmSolve(modified, basis);
+
+    check(warm.status == SolveStatus::kOptimal, "OrdRHS: warm optimal");
+    check(cold.status == SolveStatus::kOptimal, "OrdRHS: cold optimal");
+    checkNear(warm.objective_value, cold.objective_value, 1e-6, "OrdRHS: objectives match");
+    checkFeasible(modified, warm, 1e-6, "OrdRHS warm");
 }
 
 int main() {
@@ -520,6 +838,12 @@ int main() {
     run("Finite <-> Infinite bound change rejection", testBoundTypeChangeRejection);
     run("Dual Infeasible Basis Rejection", testDualInfeasibleBasisRejection);
     run("Artificial Rejection in warmSolve", testArtificialBasisRejectionWarmSolve);
+    run("Knapsack warm-start regression (19 vs 21)", testKnapsackWarmStartRegression);
+    run("Warm-start chaining", testWarmStartChaining);
+    run("Warm result matches cold result", testWarmMatchesCold);
+    run("RHS Sign Flip Rejection", testRHSSignFlipRejection);
+    run("Equality RHS Sign Flip Rejection", testEqualityRHSSignFlipRejection);
+    run("Ordinary RHS Perturbation (No Sign Flip)", testOrdinaryRHSPerturbation);
 
     std::cout << "\n" << g_checks_run << " checks run, " << g_checks_failed << " failed.\n";
     if (g_checks_failed > 0) {
