@@ -2,6 +2,7 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <cstdlib>
 
 using pramaan::CSRMatrix;
 
@@ -32,7 +33,10 @@ void test_basic_shape_and_multiply() {
 
     bool threw = false;
     try { A.multiply({1, 2}); } catch (const std::invalid_argument&) { threw = true; }
-    assert(threw);
+    if (!threw) {
+        std::cerr << "Expected std::invalid_argument\n";
+        std::exit(1);
+    }
 
     std::cout << "  test_basic_shape_and_multiply passed\n";
 }

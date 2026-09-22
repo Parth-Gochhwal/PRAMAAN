@@ -19,6 +19,8 @@ add_library(pramaan_core
     src/certificate/certificate.cpp
     src/mip/node.cpp
     src/mip/branch_and_bound.cpp
+    src/structure/fingerprint.cpp
+    src/ipm/interior_point.cpp
 )
 target_include_directories(pramaan_core PUBLIC include)
 
@@ -87,4 +89,14 @@ add_test(NAME test_mip_node COMMAND test_mip_node
 add_executable(test_branch_and_bound tests/test_branch_and_bound.cpp)
 target_link_libraries(test_branch_and_bound PRIVATE pramaan_core)
 add_test(NAME test_branch_and_bound COMMAND test_branch_and_bound
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_structural_fingerprint tests/test_structural_fingerprint.cpp)
+target_link_libraries(test_structural_fingerprint PRIVATE pramaan_core)
+add_test(NAME test_structural_fingerprint COMMAND test_structural_fingerprint
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(test_interior_point tests/test_interior_point.cpp)
+target_link_libraries(test_interior_point PRIVATE pramaan_core)
+add_test(NAME test_interior_point COMMAND test_interior_point
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
