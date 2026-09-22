@@ -30,6 +30,7 @@
 #include "pramaan/presolve.hpp"
 #include "pramaan/simplex.hpp"
 #include "pramaan/transformation_ledger.hpp"
+#include "pramaan/branch_and_bound.hpp"
 
 namespace {
 
@@ -769,18 +770,6 @@ void testActualVerifierBinary() {
     check(rc == 0, "Verifier returns 0 for valid certificate");
     check(out.find("CERTIFICATE VALID") != std::string::npos, "Verifier prints CERTIFICATE VALID");
 
-    auto corruptFile = [&](const std::string& target, const std::string& replacement) {
-        std::ifstream in(cert_path);
-        std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        in.close();
-        size_t pos = content.find(target);
-        if (pos != std::string::npos) {
-            content.replace(pos, target.length(), replacement);
-            std::ofstream out_f(cert_path);
-            out_f << content;
-        }
-    };
-
     auto runAndCheckInvalid = [&](const std::string& desc) {
         rc = runCommand(std::string(VERIFIER_EXECUTABLE) + " " + afiro_path + " " + cert_path, out);
         check(rc != 0, desc + ": Verifier returns nonzero exit code");
@@ -956,6 +945,77 @@ void testParserHardening() {
     std::cout << "  ok\n";
 }
 
+void testMilpCertificateAndTampering() {
+    std::cout << "testMilpCertificateAndTampering...\n";
+
+    // 1. Write an MPS file for the knapsack problem.
+    const std::string mps_path = "test_knapsack.mps";
+    {
+        std::ofstream out(mps_path);
+        out << "NAME KNAPSACK\n";
+        out << "ROWS\n";
+        out << " N  OBJ\n";
+        out << " L  CAP\n";
+        out << "COLUMNS\n";
+        out << "    MARKER    'MARKER'  'INTORG'\n";
+        out << "    x0        OBJ       -8.0   CAP  5.0\n";
+        out << "    x1        OBJ       -11.0  CAP  7.0\n";
+        out << "    x2        OBJ       -6.0   CAP  4.0\n";
+        out << "    x3        OBJ       -4.0   CAP  3.0\n";
+        out << "    MARKER    'MARKER'  'INTEND'\n";
+        out << "RHS\n";
+        out << "    RHS1      CAP       14.0\n";
+        out << "BOUNDS\n";
+        out << " UP BND1      x0        1.0\n";
+        out << " UP BND1      x1        1.0\n";
+        out << " UP BND1      x2        1.0\n";
+        out << " UP BND1      x3        1.0\n";
+        out << "ENDATA\n";
+    }
+
+    // 2. Parse and solve.
+    pramaan::ModelIR model = pramaan::parse_mps(mps_path);
+
+    // Explicitly verify that INTORG/INTEND parsed correctly.
+    check(model.numVars() == 4, "MILP parser recognized 4 variables");
+    for (int j = 0; j < 4; ++j) {
+        check(model.var_types[static_cast<std::size_t>(j)] == pramaan::VarType::kInteger,
+              "Variable " + std::to_string(j) + " parsed as integer");
+    }
+
+    pramaan::mip::BranchAndBound::Options opts;
+    opts.use_warm_start = true;
+    pramaan::mip::BranchAndBound bnb(opts);
+    pramaan::mip::MipResult res = bnb.solve(model);
+    check(res.status == pramaan::mip::MipStatus::kOptimal, "MILP solved optimally");
+    checkNear(res.objective_value, -21.0, 1e-6, "MILP optimal objective");
+
+    // 3. Generate certificate and write it.
+    std::string cert_path = "test_knapsack.cert";
+    pramaan::Certificate cert = pramaan::generate_certificate(model, res.x, "OPTIMAL", 0);
+    pramaan::write_certificate(cert, cert_path);
+
+    // 4. Run verifier on valid certificate.
+    std::string out_str;
+    int rc = runCommand(std::string(VERIFIER_EXECUTABLE) + " " + mps_path + " " + cert_path, out_str);
+    check(rc == 0, "Verifier returns 0 for valid MILP certificate");
+    check(out_str.find("CERTIFICATE VALID") != std::string::npos, "Verifier prints CERTIFICATE VALID for MILP");
+
+    // 5. Tamper with an integer variable (x1).
+    cert.x[1] += 0.25;
+    pramaan::write_certificate(cert, cert_path);
+    rc = runCommand(std::string(VERIFIER_EXECUTABLE) + " " + mps_path + " " + cert_path, out_str);
+
+    check(rc != 0, "Verifier returns nonzero exit code for tampered integer variable");
+    check(out_str.find("CERTIFICATE INVALID") != std::string::npos, "Verifier prints CERTIFICATE INVALID for tampered MILP");
+    check(out_str.find("Integrality violation") != std::string::npos, "Verifier attributes failure to Integrality violation");
+
+    // Cleanup
+    std::remove(mps_path.c_str());
+    std::remove(cert_path.c_str());
+    std::cout << "  ok\n";
+}
+
 }  // namespace
 
 int main() {
@@ -974,6 +1034,7 @@ int main() {
     testAfiroTampering();
     testActualVerifierBinary();
     testParserHardening();
+    testMilpCertificateAndTampering();
 
     std::cout << "\n" << g_checks_run << " checks run, " << g_checks_failed
                << " failed.\n";

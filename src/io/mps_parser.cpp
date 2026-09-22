@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace pramaan {
@@ -116,6 +117,10 @@ ModelIR parse_mps(const std::string& filepath) {
     struct BoundInfo { double lo; double hi; bool lo_set; bool hi_set; };
     std::unordered_map<int, BoundInfo> bounds_override;
 
+    // Integer variable tracking: INTORG/INTEND markers in the COLUMNS section.
+    std::unordered_set<int> integer_vars;
+    bool in_integer_section = false;
+
     // --- Parse the file line by line, dispatching on the current section.
     enum class Section { kNone, kName, kRows, kColumns, kRhs, kRanges, kBounds };
     Section section = Section::kNone;
@@ -199,6 +204,17 @@ ModelIR parse_mps(const std::string& filepath) {
         }
 
         case Section::kColumns: {
+            // Check for INTORG/INTEND markers.
+            if (tokens.size() >= 3 && tokens[1] == "'MARKER'") {
+                if (tokens[2] == "'INTORG'") {
+                    in_integer_section = true;
+                    continue;
+                } else if (tokens[2] == "'INTEND'") {
+                    in_integer_section = false;
+                    continue;
+                }
+            }
+
             // Format: var_name  row_name  value  [row_name  value]
             if (tokens.size() < 3 || tokens.size() == 4) {
                 throw std::runtime_error(
@@ -208,6 +224,9 @@ ModelIR parse_mps(const std::string& filepath) {
             }
             const std::string& vname = tokens[0];
             int vidx = getOrCreateVar(vname);
+            if (in_integer_section) {
+                integer_vars.insert(vidx);
+            }
 
             // Process one or two (row_name, value) pairs on this line.
             for (std::size_t p = 1; p + 1 < tokens.size(); p += 2) {
@@ -447,9 +466,12 @@ ModelIR parse_mps(const std::string& filepath) {
         if (bi.hi_set) var_upper[static_cast<std::size_t>(vidx)] = bi.hi;
     }
 
-    // Variable types: all continuous (integer support deferred).
+    // Variable types: continuous by default, integer if marked.
     std::vector<VarType> var_types(static_cast<std::size_t>(num_vars),
                                    VarType::kContinuous);
+    for (int vidx : integer_vars) {
+        var_types[static_cast<std::size_t>(vidx)] = VarType::kInteger;
+    }
 
     return ModelIR(
         ObjSense::kMinimize,

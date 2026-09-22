@@ -318,6 +318,68 @@ void testIncompatibleBasisFallback() {
     check(res.statistics.branchings >= 1, "fallback: branching occurred");
 }
 
+// Warm-starting must NEVER change the final answer — only the internal path.
+// This test runs the SAME knapsack MILP in two modes:
+//   Mode A: fully cold (use_warm_start = false)
+//   Mode B: warm-started (use_warm_start = true)
+// and asserts that every observable result property is identical.
+void testWarmVsColdComparison() {
+    const ModelIR model = makeKnapsack();
+    const double tol = 1e-6;
+
+    // --- Mode A: fully cold B&B ---
+    BranchAndBound::Options cold_opts;
+    cold_opts.use_warm_start = false;
+    const BranchAndBound cold_bnb(cold_opts);
+    const MipResult cold = cold_bnb.solve(model);
+
+    // --- Mode B: warm-started B&B ---
+    BranchAndBound::Options warm_opts;
+    warm_opts.use_warm_start = true;
+    const BranchAndBound warm_bnb(warm_opts);
+    const MipResult warm = warm_bnb.solve(model);
+
+    // 1. Solve status must agree.
+    check(cold.status == MipStatus::kOptimal, "cold-vs-warm: cold status is kOptimal");
+    check(warm.status == MipStatus::kOptimal, "cold-vs-warm: warm status is kOptimal");
+    check(cold.status == warm.status, "cold-vs-warm: statuses match");
+
+    // 2. Final objective must agree within tolerance.
+    checkNear(cold.objective_value, warm.objective_value, tol,
+              "cold-vs-warm: objectives match");
+    checkNear(cold.objective_value, 21.0, tol,
+              "cold-vs-warm: objective is the hand-computed 21");
+
+    // 3. Final incumbent vector must agree within tolerance.
+    check(cold.x.size() == warm.x.size(), "cold-vs-warm: x vector sizes match");
+    if (cold.x.size() == warm.x.size()) {
+        for (std::size_t j = 0; j < cold.x.size(); ++j) {
+            std::ostringstream d;
+            d << "cold-vs-warm: x[" << j << "] matches";
+            checkNear(cold.x[j], warm.x[j], tol, d.str());
+        }
+    }
+
+    // 4. Final incumbent feasibility (both modes).
+    checkFeasibleAndIntegral(model, cold.x, 1e-9, "cold-vs-warm cold");
+    checkFeasibleAndIntegral(model, warm.x, 1e-9, "cold-vs-warm warm");
+
+    // 5. Prove that the warm-start path was ACTUALLY exercised.
+    check(cold.statistics.warm_start_attempts == 0,
+          "cold-vs-warm: cold mode made zero warm-start attempts");
+    check(warm.statistics.warm_start_attempts > 0,
+          "cold-vs-warm: warm mode attempted warm starts");
+    check(warm.statistics.warm_start_successes > 0,
+          "cold-vs-warm: at least one warm start actually succeeded");
+
+    std::cout << "    cold: nodes=" << cold.statistics.nodes_explored
+              << " warm_starts=" << cold.statistics.warm_start_successes
+              << "/" << cold.statistics.warm_start_attempts << "\n";
+    std::cout << "    warm: nodes=" << warm.statistics.nodes_explored
+              << " warm_starts=" << warm.statistics.warm_start_successes
+              << "/" << warm.statistics.warm_start_attempts << "\n";
+}
+
 }  // namespace
 
 int main() {
@@ -328,6 +390,7 @@ int main() {
     run("Mixed integer/continuous model", testMixedIntegerContinuous);
     run("Warm-start plumbing (option off by default)", testWarmStartPlumbing);
     run("Incompatible inherited basis falls back cleanly", testIncompatibleBasisFallback);
+    run("Warm-vs-cold B&B comparison (final answer invariance)", testWarmVsColdComparison);
 
     std::cout << "\n" << g_checks_run << " checks run, " << g_checks_failed << " failed.\n";
     if (g_checks_failed > 0) {
