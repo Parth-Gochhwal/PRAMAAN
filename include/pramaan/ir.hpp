@@ -118,4 +118,8 @@ struct ModelIR {
     void validate() const;
 };
 
+// Computes a deterministic 64-bit FNV-1a hash of the model structure and coefficients.
+std::uint64_t computeModelFingerprint(const ModelIR& model);
+std::uint64_t computeStructuralFingerprint(const ModelIR& model);
+
 }  // namespace pramaan

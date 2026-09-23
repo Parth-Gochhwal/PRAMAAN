@@ -22,12 +22,15 @@
 // 6. Node state transitions (unevaluated -> optimal / infeasible) behave.
 // 7. Empty-box branches are reported as inconsistent, not handed to the LP.
 // 8. buildRelaxation() applies node bounds and leaves the rest untouched.
+// 9. addCut() validates the cut and throws on structural violations.
+// 10. makeChild() throws on out-of-range variable or non-finite bound.
 #include <cmath>
 #include <functional>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <stdexcept>
 
 #include "pramaan/node.hpp"
 #include "pramaan/dual_simplex.hpp"
@@ -45,6 +48,7 @@ using pramaan::SolveResult;
 using pramaan::SolveStatus;
 using pramaan::VarType;
 using pramaan::mip::BranchDirection;
+using pramaan::mip::Cut;
 using pramaan::mip::Node;
 using pramaan::mip::NodeState;
 
@@ -275,6 +279,154 @@ void testBuildRelaxation() {
     checkNear(model.var_upper[0], 4.0, 1e-12, "buildRelaxation does not mutate the original model");
 }
 
+// Issue 3: addCut() must validate the cut before inserting.
+void testInvalidCut() {
+    const ModelIR model = makeTinyIntegerLP();
+    Node node = Node::makeRoot(model);
+    const int num_vars = model.numVars();
+
+    // 1. Valid cut: [x0 + x1 <= 1] — should succeed.
+    {
+        Cut c;
+        c.cols = {0, 1};
+        c.vals = {1.0, 1.0};
+        c.rhs = 1.0;
+        bool threw = false;
+        try { node.addCut(c, num_vars); }
+        catch (...) { threw = true; }
+        check(!threw, "invalid-cut: valid cut is accepted");
+    }
+
+    // 2. Size mismatch: cols.size() != vals.size()
+    {
+        Cut c;
+        c.cols = {0, 1};
+        c.vals = {1.0};  // wrong size
+        c.rhs = 1.0;
+        bool threw = false;
+        try { node.addCut(c, num_vars); }
+        catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "invalid-cut: size mismatch throws invalid_argument");
+    }
+
+    // 3. Out-of-range column index
+    {
+        Cut c;
+        c.cols = {0, 999};  // 999 is out of range for 2-var model
+        c.vals = {1.0, 1.0};
+        c.rhs = 1.0;
+        bool threw = false;
+        try { node.addCut(c, num_vars); }
+        catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "invalid-cut: out-of-range col index throws invalid_argument");
+    }
+
+    // 4. Non-finite coefficient
+    {
+        Cut c;
+        c.cols = {0};
+        c.vals = {std::numeric_limits<double>::infinity()};
+        c.rhs = 1.0;
+        bool threw = false;
+        try { node.addCut(c, num_vars); }
+        catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "invalid-cut: infinite coefficient throws invalid_argument");
+    }
+
+    // 5. Zero coefficient
+    {
+        Cut c;
+        c.cols = {0};
+        c.vals = {0.0};
+        c.rhs = 1.0;
+        bool threw = false;
+        try { node.addCut(c, num_vars); }
+        catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "invalid-cut: zero coefficient throws invalid_argument");
+    }
+
+    // 6. Non-finite rhs
+    {
+        Cut c;
+        c.cols = {0};
+        c.vals = {1.0};
+        c.rhs = std::numeric_limits<double>::infinity();
+        bool threw = false;
+        try { node.addCut(c, num_vars); }
+        catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "invalid-cut: infinite rhs throws invalid_argument");
+    }
+
+    // 7. Duplicate column index
+    {
+        Cut c;
+        c.cols = {0, 0};
+        c.vals = {1.0, 2.0};
+        c.rhs = 1.0;
+        bool threw = false;
+        try { node.addCut(c, num_vars); }
+        catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "invalid-cut: duplicate column index throws invalid_argument");
+    }
+}
+
+// Issue 3: makeChild() must validate its arguments.
+void testInvalidBranchBound() {
+    const ModelIR model = makeTinyIntegerLP();
+    const Node root = Node::makeRoot(model);
+
+    // Out-of-range variable index
+    {
+        bool threw = false;
+        try { root.makeChild(999, BranchDirection::kDown, 1.0, BasisState{}); }
+        catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "invalid-branch: out-of-range variable throws invalid_argument");
+    }
+
+    // Negative variable index
+    {
+        bool threw = false;
+        try { root.makeChild(-1, BranchDirection::kDown, 1.0, BasisState{}); }
+        catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "invalid-branch: negative variable index throws invalid_argument");
+    }
+
+    // Non-finite bound
+    {
+        bool threw = false;
+        try { root.makeChild(0, BranchDirection::kDown,
+                             std::numeric_limits<double>::infinity(), BasisState{}); }
+        catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "invalid-branch: infinite bound throws invalid_argument");
+    }
+
+    // NaN bound
+    {
+        bool threw = false;
+        try { root.makeChild(0, BranchDirection::kDown,
+                             std::numeric_limits<double>::quiet_NaN(), BasisState{}); }
+        catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "invalid-branch: NaN bound throws invalid_argument");
+    }
+}
+
+// Contradictory bounds: x0 >= 3 then x0 <= 1 must be detected as inconsistent.
+void testContradictoryBounds() {
+    const ModelIR model = makeTinyIntegerLP();
+    const Node root = Node::makeRoot(model);
+
+    const Node up = root.makeChild(0, BranchDirection::kUp, 3.0, BasisState{});
+    check(!up.hasInconsistentBounds(1e-9), "contradictory: single branch is consistent");
+
+    const Node down = up.makeChild(0, BranchDirection::kDown, 1.0, BasisState{});
+    check(down.hasInconsistentBounds(1e-9),
+          "contradictory: x0>=3 then x0<=1 is inconsistent");
+
+    // Verify the B&B engine skips solving and marks directly infeasible.
+    check(down.state() == NodeState::kUnevaluated,
+          "contradictory: node starts unevaluated (before B&B evaluates it)");
+}
+
 }  // namespace
 
 int main() {
@@ -286,6 +438,9 @@ int main() {
     run("Node state transitions", testStateTransitions);
     run("Inconsistent (empty-box) bounds are flagged", testInconsistentBounds);
     run("buildRelaxation applies node bounds only", testBuildRelaxation);
+    run("addCut validates structural invariants", testInvalidCut);
+    run("makeChild validates variable index and bound", testInvalidBranchBound);
+    run("Contradictory bounds detected correctly", testContradictoryBounds);
 
     std::cout << "\n" << g_checks_run << " checks run, " << g_checks_failed << " failed.\n";
     if (g_checks_failed > 0) {

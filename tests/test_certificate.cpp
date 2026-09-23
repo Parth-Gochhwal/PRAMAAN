@@ -733,6 +733,18 @@ void testAfiroTampering() {
         check(threw, "Tamper D: corrupted dimension throws exception");
     }
 
+    // --- Tamper E: change model fingerprint ---
+    {
+        Certificate tampered = cert;
+        tampered.model_fingerprint = "0";
+        pramaan::write_certificate(tampered, CERT_TMP);
+        Certificate parsed = pramaan::read_certificate(CERT_TMP);
+
+        std::string expected = std::to_string(pramaan::computeModelFingerprint(original));
+        bool fp_mismatch = (parsed.model_fingerprint != expected);
+        check(fp_mismatch, "Tamper E: corrupted model fingerprint detected");
+    }
+
     std::remove(CERT_TMP.c_str());
     std::cout << "  ok\n";
 }
@@ -742,7 +754,7 @@ void testAfiroTampering() {
 // =========================================================================
 void testActualVerifierBinary() {
     std::cout << "testActualVerifierBinary...\n";
-    
+
     std::string afiro_path;
     for (const char* candidate : {
              "tests/data/afiro.mps",
@@ -765,7 +777,7 @@ void testActualVerifierBinary() {
     // A. Valid AFIRO certificate
     rc = runCommand(std::string(SOLVER_EXECUTABLE) + " " + afiro_path + " " + cert_path, out);
     check(rc == 0, "Solver executed successfully");
-    
+
     rc = runCommand(std::string(VERIFIER_EXECUTABLE) + " " + afiro_path + " " + cert_path, out);
     check(rc == 0, "Verifier returns 0 for valid certificate");
     check(out.find("CERTIFICATE VALID") != std::string::npos, "Verifier prints CERTIFICATE VALID");
@@ -800,7 +812,7 @@ void testActualVerifierBinary() {
     cert.primal_residual += 50.0;
     pramaan::write_certificate(cert, cert_path);
     runAndCheckInvalid("Corrupted primal residual");
-    
+
     // D2. Corrupted integrality residual
     cert = resetAndLoad();
     cert.integrality_violation += 50.0;
@@ -818,24 +830,24 @@ void testActualVerifierBinary() {
     trunc << "PRAMAAN_CERTIFICATE_V1\nSTATUS OPTIMAL\n";
     trunc.close();
     runAndCheckInvalid("Malformed/truncated certificate");
-    
+
     // G. Invalid tolerance security check
     cert = resetAndLoad();
     cert.tolerance = 1.0; // Above max trusted 1e-4
     pramaan::write_certificate(cert, cert_path);
     runAndCheckInvalid("Tolerance too large");
-    
+
     // H. Unsupported fields check
     cert = resetAndLoad();
     cert.dual_residual = 0.0; // NOT UNAVAILABLE
     pramaan::write_certificate(cert, cert_path);
     runAndCheckInvalid("Unsupported dual_residual");
-    
+
     cert = resetAndLoad();
     cert.complementarity_residual = 0.0;
     pramaan::write_certificate(cert, cert_path);
     runAndCheckInvalid("Unsupported complementarity_residual");
-    
+
     cert = resetAndLoad();
     cert.objective_bound_gap = 0.0;
     pramaan::write_certificate(cert, cert_path);
@@ -912,12 +924,12 @@ void testParserHardening() {
 
     // Trailing numeric garbage
     testMalformedLine("OBJECTIVE ", "OBJECTIVE 0.0abc", "Parser: rejects trailing numeric garbage");
-    
+
     // Non-integer fields
     testMalformedLine("ROWS ", "ROWS 1.5", "Parser: rejects non-integer ROWS");
     testMalformedLine("COLS ", "COLS 1.5", "Parser: rejects non-integer COLS");
     testMalformedLine("LEDGER_ENTRIES ", "LEDGER_ENTRIES 1.5", "Parser: rejects non-integer LEDGER_ENTRIES");
-    
+
     // Non-numeric fields
     testMalformedLine("OBJECTIVE ", "OBJECTIVE abc", "Parser: rejects non-numeric OBJECTIVE");
 
@@ -1018,6 +1030,49 @@ void testMilpCertificateAndTampering() {
 
 }  // namespace
 
+
+// =========================================================================
+// 17. Model Fingerprint changes
+// =========================================================================
+void testModelFingerprintChanges() {
+    std::cout << "testModelFingerprintChanges...\n";
+    pramaan::ModelIR model(
+        pramaan::ObjSense::kMinimize, 10.0,
+        {1.0, 2.0},
+        denseToCSR({{1.0, 1.0}}, 2),
+        {-pramaan::kInfinity}, {10.0},
+        {"row1"},
+        {0.0, 0.0}, {pramaan::kInfinity, pramaan::kInfinity},
+        {pramaan::VarType::kContinuous, pramaan::VarType::kContinuous},
+        {"x1", "x2"});
+
+    uint64_t hash1 = pramaan::computeModelFingerprint(model);
+    uint64_t hash_struct1 = pramaan::computeStructuralFingerprint(model);
+
+    // Change obj_offset
+    model.obj_offset = 20.0;
+    uint64_t hash2 = pramaan::computeModelFingerprint(model);
+    uint64_t hash_struct2 = pramaan::computeStructuralFingerprint(model);
+    check(hash1 != hash2, "Model fingerprint changes when obj_offset changes");
+    check(hash_struct1 == hash_struct2, "Structural fingerprint is invariant to obj_offset");
+
+    // Change bound (finite to finite)
+    model.var_lower[0] = 5.0;
+    uint64_t hash3 = pramaan::computeModelFingerprint(model);
+    uint64_t hash_struct3 = pramaan::computeStructuralFingerprint(model);
+    check(hash2 != hash3, "Model fingerprint changes when finite bound changes");
+    check(hash_struct2 == hash_struct3, "Structural fingerprint is invariant to finite bound changes");
+
+    // Change bound (finite to infinite)
+    model.var_lower[0] = -pramaan::kInfinity;
+    uint64_t hash4 = pramaan::computeModelFingerprint(model);
+    uint64_t hash_struct4 = pramaan::computeStructuralFingerprint(model);
+    check(hash3 != hash4, "Model fingerprint changes when bound becomes infinite");
+    check(hash_struct3 != hash_struct4, "Structural fingerprint changes when bound becomes infinite");
+
+    std::cout << "  ok\n";
+}
+
 int main() {
     testCertificateCreation();
     testCertificateSerialization();
@@ -1035,6 +1090,7 @@ int main() {
     testActualVerifierBinary();
     testParserHardening();
     testMilpCertificateAndTampering();
+    testModelFingerprintChanges();
 
     std::cout << "\n" << g_checks_run << " checks run, " << g_checks_failed
                << " failed.\n";

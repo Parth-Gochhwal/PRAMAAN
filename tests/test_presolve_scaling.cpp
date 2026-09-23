@@ -638,7 +638,38 @@ void testAfiroEndToEnd() {
 
 }  // namespace
 
+
+void testMilpPresolve() {
+    ModelIR model;
+    model.obj_sense = ObjSense::kMaximize;
+    model.obj_coeffs = {10.0, 5.0};
+    model.var_lower = {1.0, 0.0};
+    model.var_upper = {1.0, 2.0};
+    model.var_types = {VarType::kInteger, VarType::kInteger};
+    model.var_names = {"x1", "x2"};
+    model.row_names = {"r1"};
+    model.row_lower = {-kInfinity};
+    model.row_upper = {10.0};
+    model.A = CSRMatrix({0, 2}, {0, 1}, {2.0, 3.0}, 2);
+
+    TransformationLedger ledger;
+    ModelIR reduced = presolve_fixed_variables(model, ledger);
+
+    check(reduced.numVars() == 1, "Presolve removed fixed var");
+    check(reduced.var_types[0] == VarType::kInteger, "Remaining var is integer");
+    checkNear(reduced.row_upper[0], 8.0, 1e-9, "RHS updated");
+
+    std::vector<double> reduced_x = {2.0};
+    std::vector<double> full_x = postsolve(reduced_x, ledger);
+
+    check(full_x.size() == 2, "Postsolve returns full x");
+    checkNear(full_x[0], 1.0, 1e-9, "Fixed var reconstructed");
+    checkNear(full_x[1], 2.0, 1e-9, "Other var correct");
+}
+
 int main() {
+    testMilpPresolve();
+
     testFixedVariableElimination();
     testLedgerRecording();
     testNoFixedVariables();

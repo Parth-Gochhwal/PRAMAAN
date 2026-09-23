@@ -212,6 +212,13 @@ int main(int argc, char** argv) {
         fail("Objective bound gap is currently unsupported, must be UNAVAILABLE");
     }
 
+    // 10. Model Fingerprint check
+    std::string expected_fingerprint = std::to_string(pramaan::computeModelFingerprint(model));
+    if (cert.model_fingerprint != expected_fingerprint) {
+        fail("Model fingerprint mismatch: certificate=" + cert.model_fingerprint
+             + " model=" + expected_fingerprint);
+    }
+
     // --- Result ---
     if (valid) {
         std::cout << "CERTIFICATE VALID\n";

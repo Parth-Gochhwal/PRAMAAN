@@ -1,3 +1,4 @@
+#include <cstring>
 #include "pramaan/ir.hpp"
 
 #include <stdexcept>
@@ -90,6 +91,84 @@ void ModelIR::validate() const {
         }
 
     }
+}
+
+uint64_t computeStructuralFingerprint(const ModelIR& model) {
+    uint64_t hash = 14695981039346656037ULL;
+    auto add_int = [&](uint64_t v) {
+        hash ^= v;
+        hash *= 1099511628211ULL;
+    };
+
+    add_int(model.numVars());
+    add_int(model.numRows());
+    add_int(static_cast<uint64_t>(model.obj_sense));
+
+    for (double c : model.obj_coeffs) {
+        uint64_t bits;
+        if (c == 0.0) c = 0.0;
+        std::memcpy(&bits, &c, sizeof(double));
+        hash ^= bits;
+        hash *= 1099511628211ULL;
+    }
+
+    for (auto v : model.A.rowPtr()) add_int(v);
+    for (auto v : model.A.colIdx()) add_int(v);
+
+    for (double v : model.A.values()) {
+        uint64_t bits;
+        if (v == 0.0) v = 0.0;
+        std::memcpy(&bits, &v, sizeof(double));
+        hash ^= bits;
+        hash *= 1099511628211ULL;
+    }
+    for (CSRMatrix::Index j = 0; j < model.numVars(); ++j) {
+        add_int(model.var_lower[j] <= -kInfinity ? 1 : 0);
+        add_int(model.var_upper[j] >= kInfinity ? 1 : 0);
+    }
+    for (CSRMatrix::Index r = 0; r < model.numRows(); ++r) {
+        add_int(model.isEqualityRow(r) ? 1 : 0);
+        add_int(model.isFreeRow(r) ? 1 : 0);
+        add_int(model.row_lower[r] <= -kInfinity ? 1 : 0);
+        add_int(model.row_upper[r] >= kInfinity ? 1 : 0);
+    }
+    return hash;
+}
+
+uint64_t computeModelFingerprint(const ModelIR& model) {
+    uint64_t hash = 14695981039346656037ULL;
+    auto add_double = [&](double v) {
+        uint64_t bits;
+        if (v == 0.0) v = 0.0; // normalize -0.0
+        std::memcpy(&bits, &v, sizeof(double));
+        hash ^= bits;
+        hash *= 1099511628211ULL;
+    };
+    auto add_int = [&](uint64_t v) {
+        hash ^= v;
+        hash *= 1099511628211ULL;
+    };
+
+    add_int(model.numVars());
+    add_int(model.numRows());
+    add_double(model.obj_offset);
+    add_int(static_cast<uint64_t>(model.obj_sense));
+    for (double c : model.obj_coeffs) add_double(c);
+
+    for (auto v : model.A.rowPtr()) add_int(v);
+    for (auto v : model.A.colIdx()) add_int(v);
+    for (auto v : model.A.values()) add_double(v);
+
+    for (CSRMatrix::Index j = 0; j < model.numVars(); ++j) {
+        add_double(model.var_lower[j]);
+        add_double(model.var_upper[j]);
+        add_int(static_cast<uint64_t>(model.var_types[j]));
+    }
+    for (CSRMatrix::Index r = 0; r < model.numRows(); ++r) {
+        add_double(model.row_lower[r]);
+        add_double(model.row_upper[r]);
+    }
+    return hash;
 }
 
 }  // namespace pramaan

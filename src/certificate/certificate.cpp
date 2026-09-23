@@ -28,6 +28,7 @@ Certificate generate_certificate(const ModelIR& model,
     cert.status = status;
     cert.num_rows = model.numRows();
     cert.num_cols = model.numVars();
+    cert.model_fingerprint = std::to_string(computeModelFingerprint(model));
     cert.ledger_entries = ledger_entries;
     cert.x = x;
 
@@ -137,6 +138,7 @@ void write_certificate(const Certificate& cert, const std::string& filepath) {
     out << "BOUND_VIOLATION " << cert.bound_violation << "\n";
     out << "INTEGRALITY_VIOLATION " << cert.integrality_violation << "\n";
     write_opt("OBJECTIVE_BOUND_GAP", cert.objective_bound_gap);
+    out << "MODEL_FINGERPRINT " << cert.model_fingerprint << "\n";
     out << "LEDGER_ENTRIES " << cert.ledger_entries << "\n";
     out << "X\n";
     for (const double v : cert.x) {
@@ -242,6 +244,8 @@ Certificate read_certificate(const std::string& filepath) {
     cert.bound_violation = parse_key_double(read_line(), "BOUND_VIOLATION ");
     cert.integrality_violation = parse_key_double(read_line(), "INTEGRALITY_VIOLATION ");
     cert.objective_bound_gap = parse_key_opt_double(read_line(), "OBJECTIVE_BOUND_GAP ");
+
+    cert.model_fingerprint = parse_key_str(read_line(), "MODEL_FINGERPRINT ");
 
     cert.ledger_entries = parse_key_int(read_line(), "LEDGER_ENTRIES ");
     if (cert.ledger_entries < 0) throw std::runtime_error("Negative LEDGER_ENTRIES");

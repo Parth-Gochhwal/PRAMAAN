@@ -318,45 +318,25 @@ void testIncompatibleBasis() {
         {0.0}, {10.0},
         {VarType::kContinuous},
         {"x"});
-    bool threw = false;
-    try {
-        ds.warmSolve(different_dim, basis);
-    } catch (const std::invalid_argument&) {
-        threw = true;
-    }
-    check(threw, "IncompatBasis: throws on dimension mismatch");
+    SolveResult res = ds.warmSolve(different_dim, basis);
+    check(res.status == SolveStatus::kWarmStartRejected, "IncompatBasis: rejects dimension mismatch");
 
     // Objective coefficient mismatch
     ModelIR different_obj = model;
     different_obj.obj_coeffs[0] = 99.0;
-    threw = false;
-    try {
-        ds.warmSolve(different_obj, basis);
-    } catch (const std::invalid_argument&) {
-        threw = true;
-    }
-    check(threw, "IncompatBasis: throws on objective mismatch");
+    SolveResult res2 = ds.warmSolve(different_obj, basis);
+    check(res2.status == SolveStatus::kWarmStartRejected, "IncompatBasis: rejects objective mismatch");
 
     // Matrix coefficient mismatch
     ModelIR different_mat = model;
     different_mat.A = denseToCSR({{1.0, 0.0}, {0.0, 99.0}, {3.0, 2.0}}, 2);
-    threw = false;
-    try {
-        ds.warmSolve(different_mat, basis);
-    } catch (const std::invalid_argument&) {
-        threw = true;
-    }
-    check(threw, "IncompatBasis: throws on matrix mismatch");
+    SolveResult res3 = ds.warmSolve(different_mat, basis);
+    check(res3.status == SolveStatus::kWarmStartRejected, "IncompatBasis: rejects matrix mismatch");
 
     // Empty basis
     BasisState empty;
-    bool threw2 = false;
-    try {
-        ds.warmSolve(model, empty);
-    } catch (const std::invalid_argument&) {
-        threw2 = true;
-    }
-    check(threw2, "IncompatBasis: throws on empty basis");
+    SolveResult res4 = ds.warmSolve(model, empty);
+    check(res4.status == SolveStatus::kWarmStartRejected, "IncompatBasis: rejects empty basis");
 }
 
 // =========================================================================
@@ -434,13 +414,8 @@ void testBoundTypeChangeRejection() {
     ModelIR modified = model;
     modified.var_upper[0] = kInfinity;
 
-    bool threw = false;
-    try {
-        ds.warmSolve(modified, basis);
-    } catch (const std::invalid_argument&) {
-        threw = true;
-    }
-    check(threw, "BoundTypeChange: throws on finite -> infinite bound change");
+    SolveResult res = ds.warmSolve(modified, basis);
+    check(res.status == SolveStatus::kWarmStartRejected, "BoundTypeChange: throws on finite -> infinite bound change");
 }
 
 // =========================================================================
@@ -500,13 +475,8 @@ void testArtificialBasisRejectionWarmSolve() {
     // Force an artificial variable into the basis (slacks for equalities are artificial)
     bad_basis.basis_columns = {0, 2};
 
-    bool threw = false;
-    try {
-        ds.warmSolve(model, bad_basis);
-    } catch (const std::invalid_argument&) {
-        threw = true;
-    }
-    check(threw, "ArtificialReject: warmSolve rejects artificial columns");
+    SolveResult res = ds.warmSolve(model, bad_basis);
+    check(res.status == SolveStatus::kWarmStartRejected, "ArtificialReject: warmSolve rejects artificial columns");
 }
 
 // =========================================================================
@@ -722,15 +692,10 @@ void testWarmMatchesCold() {
 // =========================================================================
 // Test 14: RHS Sign Flip Rejection
 // =========================================================================
-// Changing a finite RHS across zero can cause buildSparseStandardForm to flip
-// the row's standard-form sign and RowKind (e.g., kLessEqual -> kGreaterEqual),
-// adding new structural columns (slack -> surplus + artificial).
-// The warm path must detect this layout change and cleanly reject the basis.
 void testRHSSignFlipRejection() {
-    // x0 - x1 <= 5 (RHS > 0, standard form: x0 - x1 + s = 5)
     ModelIR model(ObjSense::kMaximize, 0.0,
                    {1.0, 1.0},
-                   denseToCSR({{1.0, -1.0}}, 2),
+                   denseToCSR({{1.0, 1.0}}, 2),
                    {-kInfinity}, {5.0}, {"cap"},
                    {0.0, 0.0}, {10.0, 10.0},
                    {VarType::kContinuous, VarType::kContinuous},
@@ -740,30 +705,18 @@ void testRHSSignFlipRejection() {
     BasisState basis = ds.captureBasis(model);
     check(!basis.empty(), "RHSSignFlip: original basis captured");
 
-    // Modify RHS to -5. x0 - x1 <= -5 is equivalent to -x0 + x1 >= 5.
-    // Standard form: -x0 + x1 - surplus + artificial = 5.
+    // Modify RHS to -5. The structural slack bound changes from >= 0 to <= 0,
+    // which structurally flips the standard form.
     ModelIR modified = model;
     modified.row_upper[0] = -5.0;
 
-    bool threw = false;
-    try {
-        ds.warmSolve(modified, basis);
-    } catch (const std::invalid_argument& e) {
-        std::string msg = e.what();
-        if (msg.find("layout mismatch") != std::string::npos) {
-            threw = true;
-        }
-    }
-
-    check(threw, "RHSSignFlip: warmSolve cleanly rejected the structurally shifted standard-form matrix");
+    SolveResult res = ds.warmSolve(modified, basis);
+    check(res.status == SolveStatus::kWarmStartRejected, "RHSSignFlip: warmSolve cleanly rejected the structurally shifted standard-form matrix");
 }
 
 // =========================================================================
 // Test 15: Equality RHS Sign Flip Rejection
 // =========================================================================
-// For equality rows, changing RHS across zero negates the standard-form A
-// coefficients but does NOT change the number of columns (adds exactly 1 artificial).
-// The full std_layout_fingerprint (which hashes A.values) must catch this and reject.
 void testEqualityRHSSignFlipRejection() {
     ModelIR model(ObjSense::kMaximize, 0.0,
                    {1.0, 1.0},
@@ -782,17 +735,8 @@ void testEqualityRHSSignFlipRejection() {
     modified.row_lower[0] = -5.0;
     modified.row_upper[0] = -5.0;
 
-    bool threw = false;
-    try {
-        ds.warmSolve(modified, basis);
-    } catch (const std::invalid_argument& e) {
-        std::string msg = e.what();
-        if (msg.find("layout mismatch") != std::string::npos) {
-            threw = true;
-        }
-    }
-
-    check(threw, "EqRHSSignFlip: warmSolve cleanly rejected the structurally shifted (negated) standard-form matrix");
+    SolveResult res = ds.warmSolve(modified, basis);
+    check(res.status == SolveStatus::kWarmStartRejected, "EqRHSSignFlip: warmSolve cleanly rejected the structurally shifted (negated) standard-form matrix");
 }
 
 // =========================================================================

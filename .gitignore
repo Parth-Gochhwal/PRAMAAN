@@ -1,12 +1,16 @@
 # Build directories
 build/
+build-*/
 cmake-build-*/
+Testing/
 
 # CMake
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
+CTestTestfile.cmake
+compile_commands.json
 
 # Compiled files
 *.o
@@ -19,6 +23,7 @@ Makefile
 # Python
 __pycache__/
 *.py[cod]
+venv/
 
 # Editor temporary files
 *.swp
@@ -27,8 +32,11 @@ __pycache__/
 # OS-generated files
 .DS_Store
 Thumbs.db
-venv/
 
-# Benchmark data (downloaded Netlib instances) and output (certificates/logs)
+# Temporary error/log files from tests and tools
+err*.txt
+out*.txt
+
+# Benchmark data and output (certificates/logs — generated artifacts, not fixtures)
 benchmark/data/
 benchmark/output/

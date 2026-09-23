@@ -28,6 +28,7 @@ enum class SolveStatus {
     kUnbounded,          // objective is unbounded on the feasible region
     kIterationLimit,   // stopped without a conclusive result (see SolveResult::iterations)
     kNumericalFailure, // stopped due to unrecoverable numerical instability
+    kWarmStartRejected // basis was structurally incompatible or invalid
 };
 
 // Result of RevisedSimplex::solve().

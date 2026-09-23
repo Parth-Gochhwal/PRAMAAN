@@ -63,6 +63,9 @@ struct Certificate {
     // does not produce an independent dual bound. This is left empty.
     std::optional<double> objective_bound_gap;
 
+    // Deterministic 64-bit structural fingerprint of the model.
+    std::string model_fingerprint;
+
     // Number of transformation ledger entries applied (for auditability).
     int ledger_entries = 0;
 

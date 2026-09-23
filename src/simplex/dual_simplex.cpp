@@ -37,42 +37,6 @@ namespace {
 
 using Index = CSRMatrix::Index;
 
-uint64_t computeStructuralFingerprint(const ModelIR& model) {
-    uint64_t hash = 14695981039346656037ULL;
-    auto add_double = [&](double v) {
-        uint64_t bits;
-        if (v == 0.0) v = 0.0; // normalize -0.0
-        std::memcpy(&bits, &v, sizeof(double));
-        hash ^= bits;
-        hash *= 1099511628211ULL;
-    };
-    auto add_int = [&](uint64_t v) {
-        hash ^= v;
-        hash *= 1099511628211ULL;
-    };
-
-    add_int(model.numVars());
-    add_int(model.numRows());
-    add_int(static_cast<uint64_t>(model.obj_sense));
-    for (double c : model.obj_coeffs) add_double(c);
-
-    for (auto v : model.A.rowPtr()) add_int(v);
-    for (auto v : model.A.colIdx()) add_int(v);
-    for (auto v : model.A.values()) add_double(v);
-
-    for (Index j = 0; j < model.numVars(); ++j) {
-        add_int(model.var_lower[j] <= -kInfinity ? 1 : 0);
-        add_int(model.var_upper[j] >= kInfinity ? 1 : 0);
-    }
-    for (Index r = 0; r < model.numRows(); ++r) {
-        add_int(model.isEqualityRow(r) ? 1 : 0);
-        add_int(model.isFreeRow(r) ? 1 : 0);
-        add_int(model.row_lower[r] <= -kInfinity ? 1 : 0);
-        add_int(model.row_upper[r] >= kInfinity ? 1 : 0);
-    }
-    return hash;
-}
-
 // --- Standard-form data structures (same as revised_simplex.cpp) ----------
 
 struct ColumnMap {
@@ -99,6 +63,8 @@ struct SparseStandardForm {
     std::vector<bool> is_artificial;
     std::vector<Index> initial_basis;
 };
+
+
 
 uint64_t computeLayoutFingerprint(const SparseStandardForm& sf) {
     uint64_t hash = 8469598103934665603ULL;
@@ -935,22 +901,18 @@ SolveResult DualSimplex::warmSolve(const ModelIR& model, const BasisState& basis
     model.validate();
 
     if (basis_state.empty()) {
-        throw std::invalid_argument("DualSimplex::warmSolve: empty basis state");
+        SolveResult rej; rej.status = SolveStatus::kWarmStartRejected; return rej;
     }
 
     // Compatibility checks
     if (model.numVars() != basis_state.orig_num_vars ||
         model.numRows() != basis_state.orig_num_rows ||
         model.obj_sense != basis_state.orig_obj_sense) {
-        throw std::invalid_argument(
-            "DualSimplex::warmSolve: model is incompatible with the cached basis "
-            "(num_vars, num_rows, or obj_sense changed)");
+        SolveResult rej; rej.status = SolveStatus::kWarmStartRejected; return rej;
     }
 
     if (computeStructuralFingerprint(model) != basis_state.structural_fingerprint) {
-        throw std::invalid_argument(
-            "DualSimplex::warmSolve: model is structurally incompatible with the cached basis "
-            "(objective coefficients, matrix coefficients, or standard-form bounds changed)");
+        SolveResult rej; rej.status = SolveStatus::kWarmStartRejected; return rej;
     }
 
     const double tol = options_.tolerance;
@@ -980,18 +942,12 @@ SolveResult DualSimplex::warmSolve(const ModelIR& model, const BasisState& basis
     // rows changed (e.g. because a variable's finite bound became infinite or
     // vice versa, which adds/removes bound rows), the cached basis is invalid.
     if (static_cast<Index>(basis_state.basis_columns.size()) != num_rows_std) {
-        throw std::invalid_argument(
-            "DualSimplex::warmSolve: standard-form dimension mismatch — "
-            "the RHS/bound change altered the number of standard-form rows, "
-            "which invalidates the cached basis");
+        SolveResult rej; rej.status = SolveStatus::kWarmStartRejected; return rej;
     }
 
     uint64_t sf_hash = computeLayoutFingerprint(sf);
     if (sf_hash != basis_state.std_layout_fingerprint) {
-        throw std::invalid_argument(
-            "DualSimplex::warmSolve: standard-form layout mismatch — "
-            "the RHS change caused a row sign flip that restructured the matrix, "
-            "which invalidates the cached basis");
+        SolveResult rej; rej.status = SolveStatus::kWarmStartRejected; return rej;
     }
 
     // Validate that all basis column indices are in range and non-duplicate.
@@ -1001,13 +957,13 @@ SolveResult DualSimplex::warmSolve(const ModelIR& model, const BasisState& basis
         for (Index i = 0; i < num_rows_std; ++i) {
             Index col = basis_state.basis_columns[static_cast<std::size_t>(i)];
             if (col < 0 || col >= sf.A.num_cols) {
-                throw std::invalid_argument("DualSimplex::warmSolve: basis column index out of range");
+                SolveResult rej; rej.status = SolveStatus::kWarmStartRejected; return rej;
             }
             if (seen[static_cast<std::size_t>(col)]) {
-                throw std::invalid_argument("DualSimplex::warmSolve: duplicate basis column");
+                SolveResult rej; rej.status = SolveStatus::kWarmStartRejected; return rej;
             }
             if (sf.is_artificial[static_cast<std::size_t>(col)]) {
-                throw std::invalid_argument("DualSimplex::warmSolve: inherited basis contains artificial variables");
+                SolveResult rej; rej.status = SolveStatus::kWarmStartRejected; return rej;
             }
             seen[static_cast<std::size_t>(col)] = true;
         }
