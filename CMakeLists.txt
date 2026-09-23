@@ -21,6 +21,7 @@ add_library(pramaan_core
     src/mip/branch_and_bound.cpp
     src/structure/fingerprint.cpp
     src/ipm/interior_point.cpp
+    src/gpu/backend_cpu.cpp
 )
 target_include_directories(pramaan_core PUBLIC include)
 target_compile_options(pramaan_core PRIVATE -Wall -Wextra -Wpedantic)
@@ -42,12 +43,12 @@ enable_testing()
 # --- GPU target ---
 option(PRAMAAN_ENABLE_CUDA "Enable CUDA GPU support" OFF)
 # CUDA architecture: override with -DPRAMAAN_CUDA_ARCHITECTURES=XX at configure time.
-# Default covers Turing (sm_75) and Ampere (sm_86); adjust for your GPU.
-set(PRAMAAN_CUDA_ARCHITECTURES "75;86" CACHE STRING "CUDA GPU architectures to compile for")
+# Default targets Blackwell-class GPUs (sm_120); override for other GPUs.
+set(PRAMAAN_CUDA_ARCHITECTURES "120" CACHE STRING "CUDA GPU architectures to compile for")
 if(PRAMAAN_ENABLE_CUDA)
     set(CMAKE_CUDA_ARCHITECTURES ${PRAMAAN_CUDA_ARCHITECTURES})
     enable_language(CUDA)
-    add_library(pramaan_gpu src/gpu/pdhg_solver.cu)
+    add_library(pramaan_gpu src/gpu/pdhg_solver.cu src/gpu/pdhg.cu)
     target_include_directories(pramaan_gpu PUBLIC include)
     target_link_libraries(pramaan_gpu PRIVATE pramaan_core)
 
@@ -59,7 +60,17 @@ if(PRAMAAN_ENABLE_CUDA)
     target_link_libraries(test_gpu_pdhg PRIVATE pramaan_core pramaan_gpu)
     add_test(NAME test_gpu_pdhg COMMAND test_gpu_pdhg
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+    add_executable(test_pdhg_kernel tests/test_pdhg_kernel.cpp)
+    target_link_libraries(test_pdhg_kernel PRIVATE pramaan_core pramaan_gpu)
+    add_test(NAME test_pdhg_kernel COMMAND test_pdhg_kernel
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
+
+add_executable(test_backend_cpu tests/test_backend_cpu.cpp)
+target_link_libraries(test_backend_cpu PRIVATE pramaan_core)
+add_test(NAME test_backend_cpu COMMAND test_backend_cpu
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_executable(test_sparse_matrix tests/test_sparse_matrix.cpp)
 target_link_libraries(test_sparse_matrix PRIVATE pramaan_core)
