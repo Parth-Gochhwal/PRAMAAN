@@ -40,3 +40,5 @@ out*.txt
 # Benchmark data and output (certificates/logs — generated artifacts, not fixtures)
 benchmark/data/
 benchmark/output/
+benchmark/rolling_horizon_results.csv
+benchmark/rolling_horizon.png

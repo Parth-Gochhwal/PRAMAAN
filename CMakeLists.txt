@@ -135,6 +135,28 @@ target_link_libraries(rolling_horizon_bench PRIVATE pramaan_core)
 add_executable(mrpl_demo benchmark/mrpl_demo.cpp)
 target_link_libraries(mrpl_demo PRIVATE pramaan_core)
 
+add_executable(rolling_horizon_mps_bench
+benchmark/rolling_horizon_mps_bench.cpp
+)
+target_link_libraries(rolling_horizon_mps_bench PRIVATE pramaan_core)
+
+add_executable(test_rolling_horizon_mps
+    tests/test_rolling_horizon_mps.cpp
+)
+target_compile_definitions(
+    test_rolling_horizon_mps
+    PRIVATE
+    BENCHMARK_EXECUTABLE="$<TARGET_FILE:rolling_horizon_mps_bench>"
+)
+
+target_link_libraries(test_rolling_horizon_mps PRIVATE pramaan_core)
+
+add_test(
+    NAME test_rolling_horizon_mps
+    COMMAND test_rolling_horizon_mps
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
 add_executable(test_rolling_horizon tests/test_rolling_horizon.cpp)
 target_link_libraries(test_rolling_horizon PRIVATE pramaan_core)
 target_compile_definitions(test_rolling_horizon PRIVATE BENCHMARK_EXECUTABLE="$<TARGET_FILE:rolling_horizon_bench>")
