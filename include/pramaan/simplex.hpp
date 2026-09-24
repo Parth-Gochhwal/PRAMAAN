@@ -13,6 +13,7 @@
 // benchmark instances accurately and efficiently using sparse matrix operations.
 #pragma once
 
+#include <limits>
 #include <vector>
 
 #include "pramaan/ir.hpp"
@@ -43,6 +44,11 @@ struct SolveResult {
     // size == model.numVars() when status == kOptimal, empty otherwise.
     std::vector<double> x;
 
+    // Feasibility residuals (when computed by the solver, e.g. PDHG).
+    // Initialized to infinity; a solver may leave these as infinity if not computed.
+    double primal_residual = std::numeric_limits<double>::infinity();
+    double dual_residual   = std::numeric_limits<double>::infinity();
+
     // c^T x + obj_offset, computed directly from `x` and the model's
     // original (un-transformed) objective, in the model's own sense
     // (i.e. this is a maximum when obj_sense == kMaximize, not a negated
@@ -56,6 +62,9 @@ struct SolveResult {
 
     // Total simplex pivots performed across both phases.
     int iterations = 0;
+
+    // Number of pivots performed during crash-basis initialization.
+    int crash_basis_pivots = 0;
 
     // True basic/nonbasic status per structural variable, in ORIGINAL
     // ModelIR variable order -- size == model.numVars() when status ==
@@ -89,6 +98,22 @@ public:
         // Solver-level tolerance used for feasibility, reduced-cost,
         // ratio-test, and related numerical comparisons.
         double tolerance = 1e-9;
+
+        // Optional primal starting-point hint (size == model.numVars() or empty).
+        //
+        // When non-empty, this vector (e.g. the GPU FP32 PDHG solution) is used
+        // to initialize the standard-form basic-variable vector x_B at the start
+        // of Phase 1, rather than the default zero-initialisation.  Specifically,
+        // This is a crash-basis/primal initialization heuristic that attempts to
+        // construct a useful basis from the supplied primal point using actual
+        // simplex pivots before Phase 1 begins.
+        //
+        // LIMITATION: PDHG produces a primal point, NOT a simplex basis.
+        // Phase 1 artificial variables still run; the hint does not bypass Phase 1.
+        // Whether pivots are saved depends on how close the hint is to a feasible
+        // simplex vertex. If the hint is ignored (e.g., wrong size), the solver
+        // falls back silently to a cold initialization.
+        std::vector<double> primal_start_hint;
     };
 
     RevisedSimplex() = default;

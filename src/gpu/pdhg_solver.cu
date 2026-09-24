@@ -103,6 +103,63 @@ CudaPtr<T> make_dev(size_t n) {
     CUDA_CHECK(cudaMalloc(&p, n * sizeof(T)));
     return CudaPtr<T>(p);
 }
+
+void ComputeFp64Residuals(const ModelIR& model,
+                          const std::vector<float>& h_x,
+                          const std::vector<float>& h_y,
+                          const std::vector<float>& h_c,
+                          const std::vector<int>& h_rp,
+                          const std::vector<int>& h_ci,
+                          const std::vector<float>& h_vl,
+                          double tol,
+                          double& out_pv,
+                          double& out_dv) {
+    const int m = static_cast<int>(model.numRows());
+    const int n = static_cast<int>(model.numVars());
+
+    std::vector<double> x_d(n), y_d(m);
+    for (int j = 0; j < n; ++j) x_d[j] = static_cast<double>(h_x[j]);
+    for (int i = 0; i < m; ++i) y_d[i] = static_cast<double>(h_y[i]);
+
+    // Primal feasibility: max violation of Ax ∈ [l_r,u_r] and x ∈ [l_x,u_x]
+    auto act = model.A.multiply(x_d);
+    double pv = 0.0;
+    for (int i = 0; i < m; ++i) {
+        if (act[i] < model.row_lower[i]) pv = std::max(pv, model.row_lower[i] - act[i]);
+        if (act[i] > model.row_upper[i]) pv = std::max(pv, act[i] - model.row_upper[i]);
+    }
+    for (int j = 0; j < n; ++j) {
+        if (x_d[j] < model.var_lower[j]) pv = std::max(pv, model.var_lower[j] - x_d[j]);
+        if (x_d[j] > model.var_upper[j]) pv = std::max(pv, x_d[j] - model.var_upper[j]);
+    }
+
+    // Dual stationarity: relative max projected reduced-cost violation
+    std::vector<double> ATy_d(n, 0.0);
+    for (int i = 0; i < m; ++i)
+        for (int k = h_rp[i]; k < h_rp[i + 1]; ++k)
+            ATy_d[h_ci[k]] += static_cast<double>(h_vl[k]) * y_d[i];
+
+    double c_norm = 1.0;
+    for (int j = 0; j < n; ++j)
+        c_norm = std::max(c_norm, static_cast<double>(std::abs(h_c[j])));
+
+    double dv = 0.0;
+    for (int j = 0; j < n; ++j) {
+        double rc   = static_cast<double>(h_c[j]) + ATy_d[j];
+        bool at_lb  = (x_d[j] <= model.var_lower[j] + tol);
+        bool at_ub  = (x_d[j] >= model.var_upper[j] - tol);
+        double viol = 0.0;
+        if (!at_lb && !at_ub)     viol = std::abs(rc);
+        else if (at_lb && !at_ub) viol = std::max(0.0, -rc);
+        else if (at_ub && !at_lb) viol = std::max(0.0,  rc);
+        dv = std::max(dv, viol);
+    }
+    dv /= c_norm;
+
+    out_pv = pv;
+    out_dv = dv;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -288,45 +345,12 @@ SolveResult PdhgSolver::solve(const ModelIR& model) {
                 CUDA_CHECK(cudaMemcpy(h_y.data(), d_y, m * sizeof(float), cudaMemcpyDeviceToHost));
 
             // ---- FP64 residual computation ----
-            std::vector<double> x_d(n), y_d(m);
-            for (int j = 0; j < n; ++j) x_d[j] = static_cast<double>(h_x[j]);
-            for (int i = 0; i < m; ++i) y_d[i] = static_cast<double>(h_y[i]);
+            double pv = 0.0, dv = 0.0;
+            ComputeFp64Residuals(model, h_x, h_y, h_c, h_rp, h_ci, h_vl, options_.tolerance, pv, dv);
 
-            // Primal feasibility: max violation of Ax ∈ [l_r,u_r] and x ∈ [l_x,u_x]
-            auto act = model.A.multiply(x_d);
-            double pv = 0.0;
-            for (int i = 0; i < m; ++i) {
-                if (act[i] < model.row_lower[i]) pv = std::max(pv, model.row_lower[i] - act[i]);
-                if (act[i] > model.row_upper[i]) pv = std::max(pv, act[i] - model.row_upper[i]);
-            }
-            for (int j = 0; j < n; ++j) {
-                if (x_d[j] < model.var_lower[j]) pv = std::max(pv, model.var_lower[j] - x_d[j]);
-                if (x_d[j] > model.var_upper[j]) pv = std::max(pv, x_d[j] - model.var_upper[j]);
-            }
-
-            // Dual stationarity: relative max projected reduced-cost violation
-            // (computed in FP64 using host ATy for accuracy)
-            std::vector<double> ATy_d(n, 0.0);
-            for (int i = 0; i < m; ++i)
-                for (int k = h_rp[i]; k < h_rp[i + 1]; ++k)
-                    ATy_d[h_ci[k]] += static_cast<double>(h_vl[k]) * y_d[i];
-
-            double c_norm = 1.0;
-            for (int j = 0; j < n; ++j)
-                c_norm = std::max(c_norm, static_cast<double>(std::abs(h_c[j])));
-
-            double dv = 0.0;
-            for (int j = 0; j < n; ++j) {
-                double rc   = static_cast<double>(h_c[j]) + ATy_d[j];
-                bool at_lb  = (x_d[j] <= model.var_lower[j] + options_.tolerance);
-                bool at_ub  = (x_d[j] >= model.var_upper[j] - options_.tolerance);
-                double viol = 0.0;
-                if (!at_lb && !at_ub)     viol = std::abs(rc);
-                else if (at_lb && !at_ub) viol = std::max(0.0, -rc);
-                else if (at_ub && !at_lb) viol = std::max(0.0,  rc);
-                dv = std::max(dv, viol);
-            }
-            dv /= c_norm;
+            // Store actual solver-computed residuals in the result
+            result.primal_residual = pv;
+            result.dual_residual   = dv;
 
             // ---- Optimal? ----
             if (pv <= options_.tolerance && dv <= options_.tolerance) {
@@ -334,6 +358,7 @@ SolveResult PdhgSolver::solve(const ModelIR& model) {
                 result.iterations = iter + 1;
                 break;
             }
+
 
             // ---- Restart detection: stagnation of combined residual ----
             // Only restart when combined residual is non-trivially large
@@ -360,8 +385,18 @@ SolveResult PdhgSolver::solve(const ModelIR& model) {
     // ---- Final sync + D → H ----
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(h_x.data(), d_x, n * sizeof(float), cudaMemcpyDeviceToHost));
+    if (m > 0) {
+        CUDA_CHECK(cudaMemcpy(h_y.data(), d_y, m * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+
     if (result.status != SolveStatus::kOptimal)
         result.iterations = options_.max_iterations;
+
+    // ---- Compute FINAL fresh residuals ----
+    double final_pv = 0.0, final_dv = 0.0;
+    ComputeFp64Residuals(model, h_x, h_y, h_c, h_rp, h_ci, h_vl, options_.tolerance, final_pv, final_dv);
+    result.primal_residual = final_pv;
+    result.dual_residual   = final_dv;
 
     // ---- Construct SolveResult ----
     result.x.resize(n);

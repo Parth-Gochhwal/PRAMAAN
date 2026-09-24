@@ -117,11 +117,55 @@ void testAdlittle() {
     std::cout << "  ok\n";
 }
 
+void testCrashBasis() {
+    std::cout << "testCrashBasis...\n";
+    std::string path;
+    for (const char* candidate : {
+             "tests/data/afiro.mps",
+             "../tests/data/afiro.mps",
+             "../../tests/data/afiro.mps"}) {
+        if (std::FILE* f = std::fopen(candidate, "r")) {
+            std::fclose(f);
+            path = candidate;
+            break;
+        }
+    }
+    if (path.empty()) {
+        std::cerr << "  skip (afiro.mps not found)\n";
+        return;
+    }
+
+    pramaan::ModelIR model = pramaan::parse_mps(path);
+    pramaan::RevisedSimplex solver;
+    pramaan::SolveResult res_cold = solver.solve(model);
+    check(res_cold.status == pramaan::SolveStatus::kOptimal, "CrashBasis: cold solve optimal");
+
+    pramaan::RevisedSimplex::Options opts;
+    opts.primal_start_hint = res_cold.x;
+    pramaan::RevisedSimplex solver_warm(opts);
+    pramaan::SolveResult res_warm = solver_warm.solve(model);
+
+    check(res_warm.status == pramaan::SolveStatus::kOptimal, "CrashBasis: warm solve optimal");
+    check(res_warm.crash_basis_pivots > 0, "CrashBasis: GPU primal solution is used to construct a crash-basis initialization");
+    check(std::abs(res_warm.objective_value - res_cold.objective_value) < 1e-8, "CrashBasis: objectives match");
+    check(res_warm.iterations <= res_cold.iterations, "CrashBasis: warm iterations <= cold iterations (empirically preserved)");
+
+    // Check final primal feasibility of warm solve
+    auto act = model.A.multiply(res_warm.x);
+    double pv = 0.0;
+    for (int i = 0; i < act.size(); ++i) {
+        if (act[i] < model.row_lower[i]) pv = std::max(pv, model.row_lower[i] - act[i]);
+        if (act[i] > model.row_upper[i]) pv = std::max(pv, act[i] - model.row_upper[i]);
+    }
+    check(pv <= 1e-6, "CrashBasis: final solution is primal feasible");
+}
+
 }  // namespace
 
 int main() {
     testAfiro();
     testAdlittle();
+    testCrashBasis();
 
     std::cout << "\n" << g_checks_run << " checks run, " << g_checks_failed
                << " failed.\n";

@@ -320,11 +320,11 @@ void driveOutArtificials(const CSCMatrix& A, std::vector<Index>& basis,
     for (Index i = 0; i < m; ++i) {
         Index bcol = basis[static_cast<std::size_t>(i)];
         if (!is_artificial[static_cast<std::size_t>(bcol)]) continue;
-        
+
         std::vector<double> y(static_cast<std::size_t>(m), 0.0);
         y[static_cast<std::size_t>(i)] = 1.0;
         btran(etas, y);
-        
+
         Index entering = -1;
         for (Index j = 0; j < n; ++j) {
             if (is_artificial[static_cast<std::size_t>(j)] || is_basic[static_cast<std::size_t>(j)]) continue;
@@ -337,14 +337,14 @@ void driveOutArtificials(const CSCMatrix& A, std::vector<Index>& basis,
                 break;
             }
         }
-        
+
         if (entering != -1) {
             std::vector<double> u(static_cast<std::size_t>(m), 0.0);
             for (Index idx = A.col_ptr[static_cast<std::size_t>(entering)]; idx < A.col_ptr[static_cast<std::size_t>(entering+1)]; ++idx) {
                 u[static_cast<std::size_t>(A.row_idx[static_cast<std::size_t>(idx)])] = A.values[static_cast<std::size_t>(idx)];
             }
             ftran(etas, u);
-            
+
             double u_p = u[static_cast<std::size_t>(i)];
             if (!std::isfinite(u_p) || std::abs(u_p) <= tol) continue;
 
@@ -521,8 +521,79 @@ SolveResult RevisedSimplex::solve(const ModelIR& model) const {
     std::vector<Index> basis = sf.initial_basis;
     std::vector<double> x_B = sf.b;
     std::vector<EtaMatrix> etas;
-
     int iterations_used = 0;
+    int crash_pivots_used = 0;
+
+    // ---- Primal initialization heuristic (Crash Basis) ----
+    // We use the GPU hint to attempt to pivot likely-basic variables into the
+    // basis BEFORE Phase 1 begins. To maintain mathematical validity (x_B >= 0
+    // and B*x_B = b), we perform strict primal ratio tests and actual Eta updates.
+    // This is a primal initialization heuristic, not a guaranteed hot-start basis,
+    // but it safely consumes the GPU result to reduce Phase 1 pivots.
+    if (!options_.primal_start_hint.empty() &&
+        static_cast<Index>(options_.primal_start_hint.size()) == n) {
+        const Index num_structural = static_cast<Index>(sf.col_map.size());
+        for (Index j = 0; j < num_structural; ++j) {
+            const ColumnMap& cm = sf.col_map[static_cast<std::size_t>(j)];
+            if (cm.sign > 0.0) {
+                double shifted = options_.primal_start_hint[static_cast<std::size_t>(cm.original_var)] - sf.var_shift[static_cast<std::size_t>(cm.original_var)];
+                if (shifted > tol) {
+                    // 1. ftran: compute u = B^{-1} A_j
+                    std::vector<double> u(static_cast<std::size_t>(num_rows_std), 0.0);
+                    for (auto k = sf.A.col_ptr[static_cast<std::size_t>(j)]; k < sf.A.col_ptr[static_cast<std::size_t>(j+1)]; ++k) {
+                        u[static_cast<std::size_t>(sf.A.row_idx[static_cast<std::size_t>(k)])] = sf.A.values[static_cast<std::size_t>(k)];
+                    }
+                    ftran(etas, u);
+
+                    // 2. Primal ratio test to maintain x_B >= 0
+                    Index leaving = -1;
+                    double best_ratio = 1e30;
+                    for (Index i = 0; i < num_rows_std; ++i) {
+                        if (u[static_cast<std::size_t>(i)] > tol) {
+                            double ratio = x_B[static_cast<std::size_t>(i)] / u[static_cast<std::size_t>(i)];
+                            if (ratio < best_ratio - tol) {
+                                best_ratio = ratio;
+                                leaving = i;
+                            } else if (std::abs(ratio - best_ratio) <= tol) {
+                                // Tie-breaking: strongly prefer to drive out artificials
+                                bool curr_art = sf.is_artificial[static_cast<std::size_t>(basis[static_cast<std::size_t>(i)])];
+                                bool prev_art = (leaving >= 0) && sf.is_artificial[static_cast<std::size_t>(basis[static_cast<std::size_t>(leaving)])];
+                                if (curr_art && !prev_art) leaving = i;
+                            }
+                        }
+                    }
+
+                    // 3. Valid pivot
+                    if (leaving != -1) {
+                        EtaMatrix eta;
+                        eta.p = leaving;
+                        double inv_u_p = 1.0 / u[static_cast<std::size_t>(leaving)];
+                        for (Index i = 0; i < num_rows_std; ++i) {
+                            if (std::abs(u[static_cast<std::size_t>(i)]) > 1e-14 || i == leaving) {
+                                eta.indices.push_back(i);
+                                eta.values.push_back(i == leaving ? inv_u_p : -u[static_cast<std::size_t>(i)] * inv_u_p);
+                            }
+                        }
+                        etas.push_back(std::move(eta));
+                        basis[static_cast<std::size_t>(leaving)] = j;
+
+                        double theta = x_B[static_cast<std::size_t>(leaving)] / u[static_cast<std::size_t>(leaving)];
+                        for (Index i = 0; i < num_rows_std; ++i) {
+                            if (i == leaving) x_B[static_cast<std::size_t>(i)] = theta;
+                            else {
+                                x_B[static_cast<std::size_t>(i)] -= theta * u[static_cast<std::size_t>(i)];
+                                if (x_B[static_cast<std::size_t>(i)] < 0.0 && x_B[static_cast<std::size_t>(i)] > -tol) {
+                                    x_B[static_cast<std::size_t>(i)] = 0.0;
+                                }
+                            }
+                        }
+                        ++iterations_used;
+                        ++crash_pivots_used;
+                    }
+                }
+            }
+        }
+    }
 
     bool need_phase1 = false;
     for (bool f : sf.is_artificial) {
@@ -544,6 +615,7 @@ SolveResult RevisedSimplex::solve(const ModelIR& model) const {
         if (st == IterateStatus::kIterationLimit) {
             result.status = SolveStatus::kIterationLimit;
             result.iterations = iterations_used;
+            result.crash_basis_pivots = crash_pivots_used;
             return result;
         }
         if (st == IterateStatus::kUnbounded) {
@@ -557,6 +629,7 @@ SolveResult RevisedSimplex::solve(const ModelIR& model) const {
         if (obj1 > tol) {
             result.status = SolveStatus::kInfeasible;
             result.iterations = iterations_used;
+            result.crash_basis_pivots = crash_pivots_used;
             return result;
         }
 
@@ -565,6 +638,7 @@ SolveResult RevisedSimplex::solve(const ModelIR& model) const {
 
     const IterateStatus st2 = iterate(sf.A, sf.b, sf.cost, basis, x_B, etas, sf.is_artificial, tol, options_.max_iterations, iterations_used);
     result.iterations = iterations_used;
+    result.crash_basis_pivots = crash_pivots_used;
 
     if (st2 == IterateStatus::kIterationLimit) {
         result.status = SolveStatus::kIterationLimit;

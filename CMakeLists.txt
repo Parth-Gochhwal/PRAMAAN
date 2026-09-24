@@ -54,7 +54,6 @@ if(PRAMAAN_ENABLE_CUDA)
 
     target_link_libraries(pramaan-solve PRIVATE pramaan_gpu)
     target_compile_definitions(pramaan-solve PRIVATE PRAMAAN_ENABLE_CUDA)
-    target_compile_definitions(pramaan_core PUBLIC PRAMAAN_ENABLE_CUDA)
 
     add_executable(test_gpu_pdhg tests/test_gpu_pdhg.cpp)
     target_link_libraries(test_gpu_pdhg PRIVATE pramaan_core pramaan_gpu)
@@ -152,3 +151,22 @@ add_test(NAME test_cli_milp_routing COMMAND test_cli_milp_routing
 add_executable(test_cli_precision_ladder tests/test_cli_precision_ladder.cpp)
 add_test(NAME test_cli_precision_ladder COMMAND test_cli_precision_ladder
          WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# --- P2 Step 3: Precision Ladder Library ---
+add_library(pramaan_precision_ladder src/gpu/precision_ladder.cpp)
+target_link_libraries(pramaan_precision_ladder PUBLIC pramaan_core)
+target_include_directories(pramaan_precision_ladder PUBLIC include)
+if(PRAMAAN_ENABLE_CUDA)
+    target_link_libraries(pramaan_precision_ladder PUBLIC pramaan_gpu)
+    target_compile_definitions(pramaan_precision_ladder PUBLIC PRAMAAN_ENABLE_CUDA)
+endif()
+
+# --- P2 Step 3: Precision Ladder tests ---
+add_executable(test_precision_ladder tests/test_precision_ladder.cpp)
+target_link_libraries(test_precision_ladder PRIVATE pramaan_precision_ladder)
+add_test(NAME test_precision_ladder COMMAND test_precision_ladder
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# --- P2 Step 3: Precision Ladder benchmark ---
+add_executable(precision_ladder_bench benchmark/precision_ladder_bench.cpp)
+target_link_libraries(precision_ladder_bench PRIVATE pramaan_precision_ladder)
